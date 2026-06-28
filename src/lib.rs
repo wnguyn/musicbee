@@ -312,6 +312,122 @@ pub fn get_album_art(path: String) -> Result<AlbumArt, String> {
     Ok(AlbumArt { mime, data })
 }
 
+/// Album cover with a Last.fm fallback: try MPD's embedded/sidecar art first,
+/// then `album.getInfo` from Last.fm when MPD has nothing. Last.fm is only
+/// consulted when `LASTFM_API_KEY` is set in the environment.
+pub fn get_cover(path: String, album_artist: String, album: String) -> Result<AlbumArt, String> {
+    if let Ok(mut mpd) = MpdClient::connect() {
+        if let Ok(data) = mpd.album_art(&path) {
+            if !data.is_empty() {
+                let mime = detect_mime(&data).to_string();
+                return Ok(AlbumArt { mime, data });
+            }
+        }
+    }
+    lastfm_album_art(&album_artist, &album)
+}
+
+/// Artist image from Last.fm `artist.getInfo`. Last.fm only.
+pub fn get_artist_image(artist: String) -> Result<AlbumArt, String> {
+    lastfm_artist_image(&artist)
+}
+
+fn lastfm_key() -> Option<String> {
+    env::var("LASTFM_API_KEY").ok().filter(|s| !s.trim().is_empty())
+}
+
+fn lastfm_album_art(artist: &str, album: &str) -> Result<AlbumArt, String> {
+    let key = lastfm_key().ok_or("LASTFM_API_KEY not set")?;
+    let url = format!(
+        "https://ws.audioscrobbler.com/2.0/?method=album.getinfo&api_key={}&artist={}&album={}&format=json",
+        key,
+        url_encode(artist),
+        url_encode(album)
+    );
+    let body = http_get_string(&url)?;
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let url = pick_image(value.get("album").and_then(|a| a.get("image")))?;
+    download_image(&url)
+}
+
+fn lastfm_artist_image(artist: &str) -> Result<AlbumArt, String> {
+    let key = lastfm_key().ok_or("LASTFM_API_KEY not set")?;
+    let url = format!(
+        "https://ws.audioscrobbler.com/2.0/?method=artist.getinfo&api_key={}&artist={}&format=json",
+        key,
+        url_encode(artist)
+    );
+    let body = http_get_string(&url)?;
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let url = pick_image(value.get("artist").and_then(|a| a.get("image")))?;
+    download_image(&url)
+}
+
+// Choose the largest non-empty image URL from a Last.fm `image` array.
+fn pick_image(images: Option<&serde_json::Value>) -> Result<String, String> {
+    let arr = images
+        .and_then(|v| v.as_array())
+        .ok_or("Last.fm response had no image array")?;
+    let rank = |s: &str| match s {
+        "mega" => 5,
+        "extralarge" => 4,
+        "large" => 3,
+        "medium" => 2,
+        "small" => 1,
+        _ => 0,
+    };
+    let mut best: Option<String> = None;
+    let mut best_rank = -1i32;
+    for item in arr {
+        let url = item.get("#text").and_then(|t| t.as_str()).unwrap_or("");
+        if url.is_empty() {
+            continue;
+        }
+        // Last.fm serves the same placeholder star for artists without a real
+        // image; treat it as "no image" so callers can fall back.
+        if url.contains("2a96cbd8b46e442fc41c2b86b821562f") {
+            continue;
+        }
+        let r = rank(item.get("size").and_then(|s| s.as_str()).unwrap_or("")) as i32;
+        if r > best_rank {
+            best_rank = r;
+            best = Some(url.to_string());
+        }
+    }
+    best.ok_or_else(|| "Last.fm had no usable image".to_string())
+}
+
+fn http_get_string(url: &str) -> Result<String, String> {
+    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    resp.into_string().map_err(|e| e.to_string())
+}
+
+fn download_image(url: &str) -> Result<AlbumArt, String> {
+    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let mut data = Vec::new();
+    resp.into_reader()
+        .take(12_000_000)
+        .read_to_end(&mut data)
+        .map_err(|e| e.to_string())?;
+    if data.is_empty() {
+        return Err("Downloaded image was empty".to_string());
+    }
+    let mime = detect_mime(&data).to_string();
+    Ok(AlbumArt { mime, data })
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 pub fn get_albums() -> Result<Vec<AlbumSummary>, String> {
     Ok(summarize_albums(&get_library()?))
 }
