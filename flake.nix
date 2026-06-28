@@ -1,5 +1,5 @@
 {
-  description = "Tauri v2 music-player PoC devShell (NixOS)";
+  description = "iced music-player devShell (NixOS)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -12,18 +12,18 @@
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = [ pkgs.pkg-config ];
         buildInputs = [
-          pkgs.webkitgtk_4_1
-          pkgs.gtk3
-          pkgs.cairo
-          pkgs.gdk-pixbuf
-          pkgs.glib
-          pkgs.pango
-          pkgs.librsvg
-          pkgs.libsoup_3
+          pkgs.fontconfig
+          pkgs.libxkbcommon
+          pkgs.vulkan-loader
+          pkgs.wayland
+          pkgs.xorg.libX11
+          pkgs.xorg.libXcursor
+          pkgs.xorg.libXi
+          pkgs.xorg.libXrandr
           pkgs.dbus
         ];
         shellHook = ''
-          echo "Tauri devShell ready: provides webkit2gtk-4.1 and GTK system deps."
+          echo "iced devShell ready: provides winit/wgpu desktop runtime deps."
         '';
       };
     };

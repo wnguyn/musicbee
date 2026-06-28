@@ -1,16 +1,11 @@
 [package]
-name = "musicbee-tauri"
+name = "musicbee-iced"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "musicbee_tauri_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+name = "musicbee_iced"
 
 [dependencies]
-tauri = { version = "2", features = [] }
+iced = { version = "0.14.0", features = ["image", "tokio"] }
 serde = { version = "1", features = ["derive"] }
-base64 = "0.22"
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }

@@ -1,5 +1,11 @@
-# musicbee-tauri
+# musicbee-iced
 
-My own music player that copies MusicBee's UI but is an MPD server. 
+Native Rust MusicBee-style MPD client built with [`iced`](https://iced.rs/).
 
-Disclaminer: GLM 5.2 was used for the frontend because I wanted to try SOTA vibe coding (glm 5.2 with oh-my-pi) and I don't vibe code usually nor am I good enough at html/react/whatever. But since this is an MPD server it's harder time to screw things up and I mean I use this personally and it's fine.
+The app talks directly to MPD over TCP (`MPD_HOST`, `MPD_PORT`, and
+`MPD_PASSWORD` are supported) and renders a native desktop UI: library search,
+track list, album art, and a bottom dock with transport controls.
+
+```sh
+cargo run
+```
