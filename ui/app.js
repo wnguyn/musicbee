@@ -64,10 +64,32 @@
   }
   const _albumArtInFlight = new Map(); // albumKey -> Promise
 
+  // Bound the number of concurrent album-art requests. Each request opens a
+  // fresh MPD TCP connection on the Rust side and can transfer hundreds of KB
+  // of image data; firing one per album card at once (a large library has
+  // hundreds of albums) floods MPD and freezes the UI. A small pool keeps the
+  // app responsive while art trickles in.
+  const ART_MAX_CONCURRENT = 4;
+  let _artActive = 0;
+  const _artWaiters = [];
+  function _artAcquire() {
+    if (_artActive < ART_MAX_CONCURRENT) { _artActive++; return Promise.resolve(); }
+    return new Promise((resolve) => _artWaiters.push(resolve));
+  }
+  function _artRelease() {
+    const next = _artWaiters.shift();
+    if (next) next(); else _artActive--;
+  }
+
   async function loadAlbumArt(albumKey, path) {
+    // state.albumArt stores: a dataUrl (art found), null (looked up, none
+    // available), or has no entry (never looked up). Caching the null result
+    // is what stops the 3s status poll from re-requesting missing art (and
+    // re-opening an MPD connection) over and over.
     if (state.albumArt.has(albumKey)) return state.albumArt.get(albumKey);
     if (_albumArtInFlight.has(albumKey)) return _albumArtInFlight.get(albumKey);
     const p = (async () => {
+      await _artAcquire();
       try {
         const res = await tauriInvoke("get_album_art", { path });
         if (res && res.data) {
@@ -75,9 +97,12 @@
           state.albumArt.set(albumKey, dataUrl);
           return dataUrl;
         }
+        state.albumArt.set(albumKey, null);
       } catch (e) {
-        // MPD may not have album art for this track — that's fine
+        // MPD has no art for this track — remember that so we don't keep asking.
+        state.albumArt.set(albumKey, null);
       } finally {
+        _artRelease();
         _albumArtInFlight.delete(albumKey);
       }
       return null;
@@ -130,6 +155,91 @@
     const ang = (h >> 2) % 180;
     return { bg: `linear-gradient(${ang}deg, hsl(${hue1},${sat}%,${lit1}%), hsl(${hue2},${sat}%,${lit2}%))`,
              initial: key.charAt(0).toUpperCase() };
+  }
+
+  // ---- Album art rendering ------------------------------------------------
+  // Swap a placeholder art tile for the real cover image, preserving any
+  // overlay labels (e.g. the album-grid genre tag). Idempotent per element.
+  function setArtImage(artEl, dataUrl) {
+    if (!dataUrl || !artEl || artEl._hasArt) return;
+    artEl._hasArt = true;
+    artEl.style.background = "none";
+    const initial = artEl.querySelector(".aa-initial");
+    if (initial) initial.remove();
+    for (const n of Array.from(artEl.childNodes)) {
+      if (n.nodeType === 3) artEl.removeChild(n); // bare-text letter placeholder
+    }
+    const img = el("img");
+    img.alt = "";
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block";
+    img.src = dataUrl;
+    artEl.insertBefore(img, artEl.firstChild);
+  }
+
+  // Lazily load art for grid tiles only when they scroll into view. A single
+  // persistent observer keeps hundreds of off-screen cards from each firing an
+  // MPD request the moment a view renders.
+  const _artObserver = ("IntersectionObserver" in window)
+    ? new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          const node = e.target;
+          _artObserver.unobserve(node);
+          const al = node._album;
+          const first = al && al.tracks && al.tracks[0];
+          if (!first) continue;
+          loadAlbumArt(al.key, first.path).then((d) => { if (d) setArtImage(node, d); });
+        }
+      }, { rootMargin: "300px" })
+    : null;
+
+  function observeArt(node, al) {
+    if (!al) return;
+    node._album = al;
+    if (_artObserver) {
+      _artObserver.observe(node);
+    } else {
+      const first = al.tracks && al.tracks[0];
+      if (first) loadAlbumArt(al.key, first.path).then((d) => { if (d) setArtImage(node, d); });
+    }
+  }
+
+  // Paint album art into a persistent single-slot element (player bar, Now
+  // Playing panels). Change-detection via `_artSig` lets the status poll call
+  // this every few seconds without rebuilding the DOM or reloading the image
+  // unless the track (or its now-available artwork) actually changed.
+  function paintArt(elem, t, phText) {
+    if (!elem) return;
+    const ak = t ? albumKey(t) : null;
+    const cached = ak ? state.albumArt.get(ak) : undefined; // dataUrl | null | undefined
+    const sig = !t ? "\u0000none" : (cached ? "img\u0000" + ak : "ph\u0000" + ak);
+    if (elem._artSig === sig) return;
+    elem._artSig = sig;
+    elem._hasArt = false;
+    elem.innerHTML = "";
+    if (!t) {
+      elem.style.background = "#202020";
+      if (phText) elem.appendChild(el("div", "np-art-ph", phText));
+      return;
+    }
+    if (cached) {
+      setArtImage(elem, cached);
+      return;
+    }
+    const st = artStyle(ak);
+    elem.style.background = st.bg;
+    elem.appendChild(el("div", "aa-initial", st.initial));
+    if (cached === undefined) {
+      loadAlbumArt(ak, t.path).then((dataUrl) => {
+        // Only apply if this slot still wants art for the same album.
+        if (dataUrl && elem._artSig === "ph\u0000" + ak) {
+          setArtImage(elem, dataUrl);
+          elem._artSig = "img\u0000" + ak;
+        }
+      });
+    }
   }
   function pathHash(path) { let h = 0; for (let i = 0; i < path.length; i++) h = (h * 31 + path.charCodeAt(i)) >>> 0; return h; }
   function deriveMeta() {
@@ -275,6 +385,9 @@
     const st = artStyle(gh._albumKey);
     const art = el("div", "gh-art", st.initial); art.style.background = st.bg;
     gh.appendChild(art);
+    const cachedArt = state.albumArt.get(gh._albumKey);
+    if (cachedArt) setArtImage(art, cachedArt);
+    else if (cachedArt === undefined) observeArt(art, { key: gh._albumKey, tracks });
     const txt = el("div", "gh-text");
     const titleRow = el("div", "gh-album", al.album || tracks[0].album);
     if (al.year || tracks[0].year) { const y = el("span", "gh-year", "(" + (al.year || tracks[0].year) + ")"); titleRow.appendChild(y); }
@@ -599,28 +712,7 @@
   }
   function renderNowPlayingView() {
     const t = state.playingIdx >= 0 ? state.tracks[state.playingIdx] : null;
-    const art = document.getElementById("npbig-art"); art.innerHTML = "";
-    if (t) {
-      const ak = albumKey(t);
-      const existing = state.albumArt.get(ak);
-      if (existing) {
-        art.style.background = "none";
-        art.innerHTML = '<img src="' + existing.replace(/"/g,'&quot;') + '" alt="" style="width:100%;height:100%;object-fit:cover">';
-      } else {
-        const st = artStyle(ak);
-        art.style.background = st.bg;
-        art.appendChild(el("div", "aa-initial", st.initial));
-        loadAlbumArt(ak, t.path).then((dataUrl) => {
-          if (dataUrl) {
-            art.style.background = "none";
-            art.innerHTML = '<img src="' + dataUrl.replace(/"/g,'&quot;') + '" alt="" style="width:100%;height:100%;object-fit:cover">';
-          }
-        });
-      }
-    } else {
-      art.style.background = "#202020";
-      art.appendChild(el("div", "np-art-ph", "No art"));
-    }
+    paintArt(document.getElementById("npbig-art"), t, "No art");
     document.getElementById("npbig-title").textContent = t ? t.title : "\u2014";
     document.getElementById("npbig-artist").textContent = t ? t.artist : "\u2014";
     document.getElementById("npbig-album").textContent = t ? t.album + "  (" + t.year + ")" : "\u2014";
@@ -636,26 +728,13 @@
     albums.forEach((al) => {
       const card = el("div", "album-card"); card._album = al;
       const art = el("div", "album-art");
-      const existing = state.albumArt.get(al.key);
-      if (existing) {
-        art.style.background = "none";
-        art.innerHTML = '<img src="' + existing.replace(/"/g,'&quot;') + '" alt="" style="width:100%;height:100%;object-fit:cover">';
-      } else {
-        const st = artStyle(al.key);
-        art.style.background = st.bg;
-        art.appendChild(el("div", "aa-initial", st.initial));
-        // lazy-load album art from MPD
-        const firstTrack = al.tracks[0];
-        if (firstTrack) {
-          loadAlbumArt(al.key, firstTrack.path).then((dataUrl) => {
-            if (dataUrl) {
-              art.style.background = "none";
-              art.innerHTML = '<img src="' + dataUrl.replace(/"/g,'&quot;') + '" alt="" style="width:100%;height:100%;object-fit:cover">';
-            }
-          });
-        }
-      }
+      const st = artStyle(al.key);
+      art.style.background = st.bg;
+      art.appendChild(el("div", "aa-initial", st.initial));
       art.appendChild(el("div", "aa-genre", al.genre));
+      const existing = state.albumArt.get(al.key);
+      if (existing) setArtImage(art, existing);
+      else if (existing === undefined) observeArt(art, al); // lazy-load when scrolled into view
       card.appendChild(art);
       card.appendChild(el("div", "album-title", al.album));
       card.appendChild(el("div", "album-artist", al.album_artist));
@@ -694,8 +773,24 @@
   function lyricsFor(t) {
     return `[Instrumental placeholder]\n\nNo lyrics available for "${t.title}" by ${t.artist}.\n\nIn a real build, MusicBee fetches and saves lyrics per track and shows them here, optionally time-synced to playback.`;
   }
+  // Build a signature for the Now Playing panels so we can skip the (heavy)
+  // text + info-table rebuild on every status poll and only redo it when the
+  // track or its rating actually changes.
+  function npSignature(t) {
+    return t ? (state.playingIdx + "\u0000" + metaOf(t).rating) : "none";
+  }
   function renderNpPanels() {
     const t = state.playingIdx >= 0 ? state.tracks[state.playingIdx] : null;
+    // album art (self-guarded; cheap to call every poll, lazily loads art)
+    paintArt(document.getElementById("np-art"), t, "No art");
+    // spectrum visualizer (built once; toggled on/off with playback)
+    const sp = $("#np-spectrum");
+    if (sp && !sp.dataset.built) { sp.dataset.built = "1"; for (let i = 0; i < 18; i++) { const b = el("div", "bar"); b.style.animationDelay = (i * 70) + "ms"; b.style.height = (8 + (i % 4) * 6) + "px"; sp.appendChild(b); } }
+    sp && sp.classList.toggle("on", !!(state.isPlaying && t));
+    // Nothing else changed since last render — skip the DOM churn.
+    const sig = npSignature(t);
+    if (sig === state._npSig) return;
+    state._npSig = sig;
     // playing tab
     $("#np-title").textContent = t ? t.title : "\u2014";
     $("#np-artist").textContent = t ? t.artist : "\u2014";
@@ -703,32 +798,6 @@
     $("#np-genre").textContent = t ? t.genre : "\u2014";
     $("#np-year").textContent = t ? t.year : "\u2014";
     $("#np-track").textContent = t ? (t.track_number + " / " + (state.albums.find((a) => a.key === albumKey(t)) || { tracks: [] }).tracks.length) : "\u2014";
-    const npArt = document.getElementById("np-art"); npArt.innerHTML = "";
-    if (t) {
-      const ak = albumKey(t);
-      const existing = state.albumArt.get(ak);
-      if (existing) {
-        npArt.style.background = "none";
-        npArt.innerHTML = '<img src="' + existing.replace(/"/g,'&quot;') + '" alt="" style="width:100%;height:100%;object-fit:cover">';
-      } else {
-        const st = artStyle(ak);
-        npArt.style.background = st.bg;
-        npArt.appendChild(el("div", "aa-initial", st.initial));
-        loadAlbumArt(ak, t.path).then((dataUrl) => {
-          if (dataUrl) {
-            npArt.style.background = "none";
-            npArt.innerHTML = '<img src="' + dataUrl.replace(/"/g,'&quot;') + '" alt="" style="width:100%;height:100%;object-fit:cover">';
-          }
-        });
-      }
-    } else {
-      npArt.style.background = "#202020";
-      npArt.appendChild(el("div", "np-art-ph", "No art"));
-    }
-    // spectrum visualizer (built once; toggled on/off with playback)
-    const sp = $("#np-spectrum");
-    if (sp && !sp.dataset.built) { sp.dataset.built = "1"; for (let i = 0; i < 18; i++) { const b = el("div", "bar"); b.style.animationDelay = (i * 70) + "ms"; b.style.height = (8 + (i % 4) * 6) + "px"; sp.appendChild(b); } }
-    sp && sp.classList.toggle("on", !!(state.isPlaying && t));
     // rating widget for current track
     const npRating = $("#np-rating");
     if (t) ratingWidget(npRating, metaOf(t).rating, (nv) => { setRating(t, nv); refreshRatingFor(t); renderNpPanels(); updateNowPlaying(); });
@@ -965,34 +1034,18 @@
   function updateNowPlaying() {
     const t = state.playingIdx >= 0 ? state.tracks[state.playingIdx] : null;
     renderNpPanels();
-    const pbArt = document.getElementById("pb-art"); pbArt.innerHTML = "";
-    if (t) {
-      const ak = albumKey(t);
-      const existing = state.albumArt.get(ak);
-      if (existing) {
-        pbArt.style.background = "none";
-        pbArt.innerHTML = '<img src="' + existing.replace(/"/g,'&quot;') + '" alt="" style="width:100%;height:100%;object-fit:cover">';
-      } else {
-        const st = artStyle(ak);
-        pbArt.style.background = st.bg;
-        pbArt.appendChild(el("div", "aa-initial", st.initial));
-        loadAlbumArt(ak, t.path).then((dataUrl) => {
-          if (dataUrl) {
-            pbArt.style.background = "none";
-            pbArt.innerHTML = '<img src="' + dataUrl.replace(/"/g,'&quot;') + '" alt="" style="width:100%;height:100%;object-fit:cover">';
-          }
-        });
-      }
-    } else {
-      pbArt.style.background = "#202020";
-      pbArt.textContent = "no art";
-    }
+    // player-bar art (self-guarded; no rebuild unless the track/art changed)
+    paintArt(document.getElementById("pb-art"), t, null);
+    refreshSpectrum();
+    // Skip the text + rating rebuild unless the track (or rating) changed.
+    const sig = npSignature(t);
+    if (sig === state._pbSig) return;
+    state._pbSig = sig;
     document.getElementById("pb-np-title").textContent = t ? t.title : "No track selected";
     document.getElementById("pb-np-artist").textContent = t ? t.artist : "";
     const pbRating = document.getElementById("pb-rating");
     if (t) ratingWidget(pbRating, metaOf(t).rating, (nv) => { setRating(t, nv); refreshRatingFor(t); renderNpPanels(); updateNowPlaying(); });
     else pbRating.innerHTML = "";
-    refreshSpectrum();
   }
   function updateStatus() {
     const base = state._activeTracks; const n = base ? base.length : state.tracks.length;
