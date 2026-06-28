@@ -28,6 +28,7 @@
     queueIdx: -1,           // index in `queue` of the currently playing track (-1 = none)
     queueSource: "",        // human label for the source (e.g. "Album: X", "All Tracks")
     queueDirty: false,      // true if queue UI needs to re-render
+    playlistVersion: -1,    // last seen MPD queue version; queue is refetched on change
     // View cache: when a view is rendered, the innerHTML of its main grid
     // is stashed here so flipping back is instant. Keyed by view name +
     // a small signature derived from sort/search/_activeTracks length.
@@ -83,6 +84,7 @@
     })();
     _albumArtInFlight.set(albumKey, p);
     return p;
+  }
   function tauriInvoke(command, args) {
     const t = window.__TAURI__;
     const invoke = t && ((t.core && t.core.invoke) || t.invoke);
@@ -111,6 +113,12 @@
   function durToSec(d) { if (!d) return 0; const p = String(d).split(":").map(Number); if (p.some(isNaN)) return 0; let t = 0; for (const n of p) t = t * 60 + n; return t; }
   function totalDur(tracks) { return tracks.reduce((a, t) => a + durToSec(t.duration), 0); }
   function albumKey(t) { return (t.album || "?") + "\u0001" + (t.album_artist || "?"); }
+  // Derive a display title from a file path (mirrors the Rust fallback).
+  function titleFromPath(path) {
+    const base = String(path || "").split("/").pop() || String(path || "");
+    const dot = base.lastIndexOf(".");
+    return dot > 0 ? base.slice(0, dot) : base;
+  }
 
   function artStyle(key) {
     let h = 0; for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
@@ -1015,7 +1023,7 @@
           console.warn("Library reload failed:", e);
         }
       }
-      if (!s.connected) return;
+      if (!s.connected) { state.playlistVersion = -1; return; }
       state.isPlaying = s.state === "play";
       state.currentTime = s.elapsed || 0;
       state.totalTime = s.duration || state.totalTime;
@@ -1024,6 +1032,30 @@
         let idx = state.tracks.findIndex((t) => t.path === s.file);
         if (idx < 0) idx = state.tracks.findIndex((t) => t.title === s.title && t.artist === s.artist && t.album === s.album);
         if (idx >= 0) state.playingIdx = idx;
+      } else if (s.state === "stop" && s.playlist_length === 0) {
+        state.playingIdx = -1;
+      }
+      // Reflect MPD's real playback modes (set by us or another client).
+      if (typeof s.repeat === "boolean" && s.repeat !== state.repeat) {
+        state.repeat = s.repeat;
+        const rb = document.getElementById("pb-repeat"); if (rb) rb.classList.toggle("active", state.repeat);
+      }
+      if (typeof s.random === "boolean" && s.random !== state.shuffle) {
+        state.shuffle = s.random;
+        const sb = document.getElementById("pb-shuffle"); if (sb) sb.classList.toggle("active", state.shuffle);
+      }
+      // MPD is the source of truth for the queue. Only re-fetch the full
+      // queue when its version counter changes (cheap on large libraries).
+      if (s.playlist_version !== state.playlistVersion) {
+        state.playlistVersion = s.playlist_version;
+        await syncQueueFromMpd();
+      }
+      // Track the currently-playing position within the queue.
+      const newQueueIdx = typeof s.song === "number" ? s.song : -1;
+      if (newQueueIdx !== state.queueIdx) {
+        state.queueIdx = newQueueIdx;
+        state.queueDirty = true;
+        renderQueueIfActive();
       }
       if (state.isPlaying) startTicker(); else stopTicker();
       updateSeekUI(); updatePlayerControls(); updateNowPlaying(); updateStatus();
@@ -1031,6 +1063,27 @@
     } catch (e) {
       state.mpdConnected = false;
       setMpdStatus(false, String(e));
+    }
+  }
+
+  // Pull MPD's actual queue (playlistinfo) and map each entry back to a
+  // library track object where possible so artwork/metadata/selection all
+  // resolve against the same objects the rest of the UI uses.
+  async function syncQueueFromMpd() {
+    try {
+      const qTracks = await tauriInvoke("get_queue");
+      if (!Array.isArray(qTracks)) return;
+      const byPath = new Map(state.tracks.map((t) => [t.path, t]));
+      state.queue = qTracks.map((qt) => byPath.get(qt.path) || qt);
+      if (!state.queueSource) {
+        state.queueSource = state.queue.length ? "MPD queue" : "";
+      } else if (!state.queue.length) {
+        state.queueSource = "";
+      }
+      state.queueDirty = true;
+      renderQueueIfActive();
+    } catch (e) {
+      console.warn("get_queue failed:", e);
     }
   }
 
@@ -1112,8 +1165,8 @@
     });
     $("#pb-play").onclick = togglePlay; $("#pb-next").onclick = nextTrack; $("#pb-prev").onclick = prevTrack; $("#pb-stop").onclick = stopPlayback;
     $("#pb-volume").oninput = (e) => setVolume(e.target.value);
-    $("#pb-shuffle").onclick = () => { state.shuffle = !state.shuffle; $("#pb-shuffle").classList.toggle("active", state.shuffle); };
-    $("#pb-repeat").onclick = () => { state.repeat = !state.repeat; $("#pb-repeat").classList.toggle("active", state.repeat); };
+    $("#pb-shuffle").onclick = () => { state.shuffle = !state.shuffle; $("#pb-shuffle").classList.toggle("active", state.shuffle); if (state.mpdConnected) tryMpd("mpd_set_random", { enabled: state.shuffle }); };
+    $("#pb-repeat").onclick = () => { state.repeat = !state.repeat; $("#pb-repeat").classList.toggle("active", state.repeat); if (state.mpdConnected) tryMpd("mpd_set_repeat", { enabled: state.repeat }); };
     $("#pb-eq").onclick = () => { state.eq = !state.eq; $("#pb-eq").classList.toggle("active", state.eq); };
     // seekbar
     $(".pb-seekbar").onmousedown = (e) => { seeking = true; seekFromMouse(e); };
