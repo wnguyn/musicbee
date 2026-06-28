@@ -244,6 +244,21 @@ pub fn get_queue() -> Result<Vec<Track>, String> {
     Ok(parse_tracks(&lines))
 }
 
+pub fn mpd_play_idx(index: u32) -> Result<(), String> {
+    MpdClient::connect()?.command(&format!("play {index}"))?;
+    Ok(())
+}
+
+pub fn mpd_clear_queue() -> Result<(), String> {
+    MpdClient::connect()?.command("clear")?;
+    Ok(())
+}
+
+pub fn mpd_delete_from_queue(index: u32) -> Result<(), String> {
+    MpdClient::connect()?.command(&format!("delete {index}"))?;
+    Ok(())
+}
+
 pub fn mpd_set_repeat(enabled: bool) -> Result<(), String> {
     MpdClient::connect()?.command(&format!("repeat {}", u8::from(enabled)))?;
     Ok(())
