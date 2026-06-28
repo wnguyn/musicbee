@@ -31,6 +31,17 @@ struct MpdStatus {
     artist: String,
     album: String,
     error: String,
+    // Position of the current song within MPD's queue (-1 when stopped/empty).
+    song: i32,
+    // MPD's queue version counter. The UI only re-fetches the queue when
+    // this changes, so polling stays cheap on large libraries.
+    playlist_version: u32,
+    // Number of songs currently in MPD's queue.
+    playlist_length: u32,
+    // 0 = off, 1 = on (MPD `repeat`/`random` flags), surfaced so the UI
+    // can reflect the real playback modes instead of local-only toggles.
+    repeat: bool,
+    random: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -111,8 +122,18 @@ impl MpdClient {
     /// stream is shared with `read_response` (binary data must not be
     /// pre-buffered separately on a different handle).
     fn album_art(&mut self, uri: &str) -> Result<Vec<u8>, String> {
+        // Prefer a sidecar cover file (`albumart`); fall back to art
+        // embedded in the file's tags (`readpicture`). MusicBee shows both,
+        // so trying both keeps artwork working regardless of how it's stored.
+        match self.fetch_binary("albumart", uri) {
+            Ok(data) => Ok(data),
+            Err(_) => self.fetch_binary("readpicture", uri),
+        }
+    }
+
+    fn fetch_binary(&mut self, command: &str, uri: &str) -> Result<Vec<u8>, String> {
         // MPD requires both URI and offset
-        let cmd = format!("albumart {} 0\n", quote_arg(uri));
+        let cmd = format!("{command} {} 0\n", quote_arg(uri));
         self.stream
             .write_all(cmd.as_bytes())
             .map_err(|e| format!("MPD write failed: {e}"))?;
@@ -196,6 +217,11 @@ fn get_mpd_status() -> MpdStatus {
             artist: String::new(),
             album: String::new(),
             error,
+            song: -1,
+            playlist_version: 0,
+            playlist_length: 0,
+            repeat: false,
+            random: false,
         },
     }
 }
@@ -244,6 +270,47 @@ fn mpd_play_idx(index: u32) -> Result<(), String> {
 #[tauri::command]
 fn mpd_delete_from_queue(index: u32) -> Result<(), String> {
     MpdClient::connect()?.command(&format!("delete {index}"))?;
+    Ok(())
+}
+
+/// Append tracks to the end of MPD's queue without disturbing playback.
+/// Mirrors MusicBee's "Add to Now Playing" / queue-next behaviour.
+#[tauri::command]
+fn mpd_enqueue(paths: Vec<String>) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("No tracks were sent to MPD".to_string());
+    }
+    let mut mpd = MpdClient::connect()?;
+    let mut command = String::from("command_list_begin\n");
+    for path in &paths {
+        command.push_str("add ");
+        command.push_str(&quote_arg(path));
+        command.push('\n');
+    }
+    command.push_str("command_list_end");
+    mpd.command(&command)?;
+    Ok(())
+}
+
+/// Return MPD's actual playback queue (the source of truth for the queue
+/// view). The UI calls this when the queue version changes so the queue
+/// always matches what MPD will really play.
+#[tauri::command]
+fn get_queue() -> Result<Vec<Track>, String> {
+    let mut mpd = MpdClient::connect()?;
+    let lines = mpd.command("playlistinfo")?;
+    Ok(parse_tracks(&lines))
+}
+
+#[tauri::command]
+fn mpd_set_repeat(enabled: bool) -> Result<(), String> {
+    MpdClient::connect()?.command(&format!("repeat {}", if enabled { 1 } else { 0 }))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn mpd_set_random(enabled: bool) -> Result<(), String> {
+    MpdClient::connect()?.command(&format!("random {}", if enabled { 1 } else { 0 }))?;
     Ok(())
 }
 
@@ -416,6 +483,11 @@ fn read_mpd_status() -> Result<MpdStatus, String> {
         // MPD's `error` field is sticky (e.g. "Failed to enable output
         // ..."); surface it so the UI can show why audio isn't playing.
         error: status.get("error").cloned().unwrap_or_default(),
+        song: status.get("song").and_then(|v| v.parse().ok()).unwrap_or(-1),
+        playlist_version: status.get("playlist").and_then(|v| v.parse().ok()).unwrap_or(0),
+        playlist_length: status.get("playlistlength").and_then(|v| v.parse().ok()).unwrap_or(0),
+        repeat: status.get("repeat").map(|v| v == "1").unwrap_or(false),
+        random: status.get("random").map(|v| v == "1").unwrap_or(false),
     })
 }
 
@@ -551,6 +623,10 @@ pub fn run() {
             mpd_clear_queue,
             mpd_play_idx,
             mpd_delete_from_queue,
+            mpd_enqueue,
+            get_queue,
+            mpd_set_repeat,
+            mpd_set_random,
             get_albums,
             get_album_tracks,
             mpd_toggle_play,
