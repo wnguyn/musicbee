@@ -1,12 +1,11 @@
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-use tauri::Manager;
-use base64::Engine;
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Track {
     pub title: String,
     pub artist: String,
@@ -19,44 +18,40 @@ pub struct Track {
     pub path: String,
 }
 
-#[derive(Serialize)]
-struct MpdStatus {
-    connected: bool,
-    state: String,
-    elapsed: u32,
-    duration: u32,
-    volume: i32,
-    file: String,
-    title: String,
-    artist: String,
-    album: String,
-    error: String,
-    // Position of the current song within MPD's queue (-1 when stopped/empty).
-    song: i32,
-    // MPD's queue version counter. The UI only re-fetches the queue when
-    // this changes, so polling stays cheap on large libraries.
-    playlist_version: u32,
-    // Number of songs currently in MPD's queue.
-    playlist_length: u32,
-    // 0 = off, 1 = on (MPD `repeat`/`random` flags), surfaced so the UI
-    // can reflect the real playback modes instead of local-only toggles.
-    repeat: bool,
-    random: bool,
+#[derive(Debug, Clone, Serialize)]
+pub struct MpdStatus {
+    pub connected: bool,
+    pub state: String,
+    pub elapsed: u32,
+    pub duration: u32,
+    pub volume: i32,
+    pub file: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub error: String,
+    pub song: i32,
+    pub playlist_version: u32,
+    pub playlist_length: u32,
+    pub repeat: bool,
+    pub random: bool,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AlbumSummary {
     pub album: String,
     pub album_artist: String,
     pub year: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct AlbumArt {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
 struct MpdClient {
     stream: TcpStream,
-    // Persistent buffered reader. MPD only sends data after a command, so
-    // the BufReader's pre-fill is bounded by MPD's response for one
-    // command; reading the same reader across calls preserves any bytes
-    // MPD sent between OK and the next read.
     reader: BufReader<TcpStream>,
 }
 
@@ -66,15 +61,14 @@ impl MpdClient {
         let password = env::var("MPD_PASSWORD").ok();
 
         let stream = TcpStream::connect(addr).map_err(|e| format!("MPD connection failed: {e}"))?;
-        // 30s is enough for listallinfo on a 5000+ track library. MPD
-        // sends the whole response before the next prompt, so a single
-        // read timeout applies to the whole payload.
         stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
         let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
         let mut line = String::new();
-        reader.read_line(&mut line).map_err(|e| format!("MPD read failed: {e}"))?;
+        reader
+            .read_line(&mut line)
+            .map_err(|e| format!("MPD read failed: {e}"))?;
         let greeting = line.trim_end_matches(['\r', '\n']).to_string();
         if !greeting.starts_with("OK MPD") {
             return Err(format!("MPD did not send a valid greeting: {greeting}"));
@@ -84,10 +78,8 @@ impl MpdClient {
         if let Some(password) = password {
             client.command(&format!("password {}", quote_arg(&password)))?;
         }
-        // Raise the binary chunk limit to 1 MiB so most album art images
-        // (typically 50–500 KB) arrive in a single round-trip instead of
-        // dozens of 8 KB requests. MPD < 0.24 doesn't support this command;
-        // ignore the ACK rather than aborting the connection.
+        // Most cover images can now arrive in one chunk. Older MPD versions
+        // reject this command, so we intentionally ignore the result.
         let _ = client.command("binarylimit 1048576");
         Ok(client)
     }
@@ -103,7 +95,10 @@ impl MpdClient {
         let mut out = Vec::new();
         loop {
             let mut line = String::new();
-            let bytes = self.reader.read_line(&mut line).map_err(|e| format!("MPD read failed: {e}"))?;
+            let bytes = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| format!("MPD read failed: {e}"))?;
             if bytes == 0 {
                 return Err("MPD closed the connection".to_string());
             }
@@ -118,18 +113,8 @@ impl MpdClient {
             out.push(line);
         }
     }
-}
 
-impl MpdClient {
-    /// Fetch album art binary data via MPD's `albumart` protocol.
-    /// Response: `size: TOTAL\nbinary: CHUNK\n<data>\n...` (chunked), then `OK\n`.
-    /// All reads go through the persistent `reader` so the same buffered
-    /// stream is shared with `read_response` (binary data must not be
-    /// pre-buffered separately on a different handle).
     fn album_art(&mut self, uri: &str) -> Result<Vec<u8>, String> {
-        // Prefer a sidecar cover file (`albumart`); fall back to art
-        // embedded in the file's tags (`readpicture`). MusicBee shows both,
-        // so trying both keeps artwork working regardless of how it's stored.
         match self.fetch_binary("albumart", uri) {
             Ok(data) => Ok(data),
             Err(_) => self.fetch_binary("readpicture", uri),
@@ -137,26 +122,12 @@ impl MpdClient {
     }
 
     fn fetch_binary(&mut self, command: &str, uri: &str) -> Result<Vec<u8>, String> {
-        // MPD binary protocol (albumart / readpicture):
-        //
-        //   Client → "albumart <URI> <OFFSET>\n"
-        //   Server → "size: <TOTAL>\n"
-        //             "binary: <CHUNK>\n"
-        //             <CHUNK raw bytes>
-        //             "\n"          ← trailing newline after binary data
-        //             "OK\n"
-        //
-        // One request returns exactly one chunk. The client must re-issue the
-        // command with an increasing offset until it has accumulated TOTAL bytes.
-        // The previous code tried to loop reading more chunks from a single
-        // response, which caused it to read the "OK" as the next "binary:"
-        // header and fail every time.
-
         fn read_text_line<R: Read>(r: &mut R) -> Result<String, String> {
             let mut out = Vec::with_capacity(64);
             loop {
                 let mut buf = [0u8; 1];
-                r.read_exact(&mut buf).map_err(|e| format!("MPD read failed: {e}"))?;
+                r.read_exact(&mut buf)
+                    .map_err(|e| format!("MPD read failed: {e}"))?;
                 if buf[0] == b'\n' {
                     return Ok(String::from_utf8_lossy(&out).into_owned());
                 }
@@ -164,73 +135,60 @@ impl MpdClient {
             }
         }
 
-        let mut data: Vec<u8> = Vec::new();
-        let mut total: Option<usize> = None;
+        let mut data = Vec::new();
+        let mut total = None;
 
         loop {
             let offset = data.len();
-
-            // Send one request for the current offset.
             let cmd = format!("{command} {} {offset}\n", quote_arg(uri));
             self.stream
                 .write_all(cmd.as_bytes())
                 .map_err(|e| format!("MPD write failed: {e}"))?;
 
-            // "size: N" — total image size (same in every response)
             let size_line = read_text_line(&mut self.reader)?;
             if size_line.starts_with("ACK") {
                 return Err(size_line);
             }
-            let sz: usize = size_line
+            let size: usize = size_line
                 .strip_prefix("size: ")
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| format!("Expected 'size:' header, got: {size_line}"))?;
             if total.is_none() {
-                data.reserve(sz);
-                total = Some(sz);
+                data.reserve(size);
+                total = Some(size);
             }
 
-            // "binary: N" — number of raw bytes that follow
-            let bin_line = read_text_line(&mut self.reader)?;
-            if bin_line.starts_with("ACK") {
-                return Err(bin_line);
+            let binary_line = read_text_line(&mut self.reader)?;
+            if binary_line.starts_with("ACK") {
+                return Err(binary_line);
             }
-            let chunk_sz: usize = bin_line
+            let chunk_size: usize = binary_line
                 .strip_prefix("binary: ")
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("Expected 'binary:' header, got: {bin_line}"))?;
-
-            if chunk_sz == 0 {
+                .ok_or_else(|| format!("Expected 'binary:' header, got: {binary_line}"))?;
+            if chunk_size == 0 {
                 return Err("MPD returned an empty binary chunk".to_string());
             }
 
-            // Read the raw binary bytes directly.
             let prev = data.len();
-            data.resize(prev + chunk_sz, 0);
+            data.resize(prev + chunk_size, 0);
             self.reader
                 .read_exact(&mut data[prev..])
                 .map_err(|e| format!("MPD binary read error: {e}"))?;
 
-            // Consume the '\n' that MPD appends after the binary data.
             let trailing = read_text_line(&mut self.reader)?;
-            // `trailing` is normally "" (empty line = just the '\n').
-            // Accept "OK" as well for any MPD implementation that skips the
-            // blank separator and goes straight to the terminator.
             if trailing == "OK" {
-                // Already consumed the terminator — we're done.
                 break;
             }
             if !trailing.is_empty() {
                 return Err(format!("Unexpected data after binary chunk: {trailing}"));
             }
 
-            // Read the "OK" that ends this response.
             let ok = read_text_line(&mut self.reader)?;
             if ok != "OK" {
                 return Err(format!("Expected OK after binary chunk, got: {ok}"));
             }
 
-            // Stop when we have all the bytes.
             if data.len() >= total.unwrap_or(0) {
                 break;
             }
@@ -240,56 +198,22 @@ impl MpdClient {
     }
 }
 
-#[tauri::command]
-fn get_library() -> Result<Vec<Track>, String> {
-    load_mpd_library()
+pub fn get_library() -> Result<Vec<Track>, String> {
+    let mut mpd = MpdClient::connect()?;
+    let lines = mpd.command("listallinfo")?;
+    Ok(parse_tracks(&lines))
 }
 
-#[tauri::command]
-fn get_mpd_status() -> MpdStatus {
-    match read_mpd_status() {
-        Ok(status) => status,
-        Err(error) => MpdStatus {
-            connected: false,
-            state: "stop".to_string(),
-            elapsed: 0,
-            duration: 0,
-            volume: -1,
-            file: String::new(),
-            title: String::new(),
-            artist: String::new(),
-            album: String::new(),
-            error,
-            song: -1,
-            playlist_version: 0,
-            playlist_length: 0,
-            repeat: false,
-            random: false,
-        },
-    }
+pub fn get_mpd_status() -> MpdStatus {
+    read_mpd_status().unwrap_or_else(disconnected_status)
 }
 
-#[tauri::command]
-fn mpd_play_path(path: String) -> Result<(), String> {
+pub fn mpd_play_path(path: String) -> Result<(), String> {
     let mut mpd = MpdClient::connect()?;
     play_paths(&mut mpd, &[path], 0)
 }
 
-#[tauri::command]
-fn mpd_play_paths(paths: Vec<String>, index: usize) -> Result<(), String> {
-    if paths.is_empty() {
-        return Err("No tracks were sent to MPD".to_string());
-    }
-    let mut mpd = MpdClient::connect()?;
-    play_paths(&mut mpd, &paths, index)
-}
-
-/// Replace MPD's queue with these paths and start playing at `index`.
-/// MPD handles queues in the thousands, so we don't cap the path count
-/// (capping to 500 silently clamped `index` to a different track when
-/// the user picked a song past the cap).
-#[tauri::command]
-fn mpd_set_queue(paths: Vec<String>, index: usize) -> Result<(), String> {
+pub fn mpd_set_queue(paths: Vec<String>, index: usize) -> Result<(), String> {
     if paths.is_empty() {
         return Err("No tracks were sent to MPD".to_string());
     }
@@ -298,28 +222,7 @@ fn mpd_set_queue(paths: Vec<String>, index: usize) -> Result<(), String> {
     play_paths(&mut mpd, &paths, index)
 }
 
-#[tauri::command]
-fn mpd_clear_queue() -> Result<(), String> {
-    MpdClient::connect()?.command("clear")?;
-    Ok(())
-}
-
-#[tauri::command]
-fn mpd_play_idx(index: u32) -> Result<(), String> {
-    MpdClient::connect()?.command(&format!("play {index}"))?;
-    Ok(())
-}
-
-#[tauri::command]
-fn mpd_delete_from_queue(index: u32) -> Result<(), String> {
-    MpdClient::connect()?.command(&format!("delete {index}"))?;
-    Ok(())
-}
-
-/// Append tracks to the end of MPD's queue without disturbing playback.
-/// Mirrors MusicBee's "Add to Now Playing" / queue-next behaviour.
-#[tauri::command]
-fn mpd_enqueue(paths: Vec<String>) -> Result<(), String> {
+pub fn mpd_enqueue(paths: Vec<String>) -> Result<(), String> {
     if paths.is_empty() {
         return Err("No tracks were sent to MPD".to_string());
     }
@@ -335,55 +238,98 @@ fn mpd_enqueue(paths: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Return MPD's actual playback queue (the source of truth for the queue
-/// view). The UI calls this when the queue version changes so the queue
-/// always matches what MPD will really play.
-#[tauri::command]
-fn get_queue() -> Result<Vec<Track>, String> {
+pub fn get_queue() -> Result<Vec<Track>, String> {
     let mut mpd = MpdClient::connect()?;
     let lines = mpd.command("playlistinfo")?;
     Ok(parse_tracks(&lines))
 }
 
-#[tauri::command]
-fn mpd_set_repeat(enabled: bool) -> Result<(), String> {
-    MpdClient::connect()?.command(&format!("repeat {}", if enabled { 1 } else { 0 }))?;
+pub fn mpd_set_repeat(enabled: bool) -> Result<(), String> {
+    MpdClient::connect()?.command(&format!("repeat {}", u8::from(enabled)))?;
     Ok(())
 }
 
-#[tauri::command]
-fn mpd_set_random(enabled: bool) -> Result<(), String> {
-    MpdClient::connect()?.command(&format!("random {}", if enabled { 1 } else { 0 }))?;
+pub fn mpd_set_random(enabled: bool) -> Result<(), String> {
+    MpdClient::connect()?.command(&format!("random {}", u8::from(enabled)))?;
     Ok(())
 }
 
-#[derive(Serialize)]
-struct AlbumArt {
-    mime: String,
-    data: String,
-}
-
-fn detect_mime(data: &[u8]) -> &'static str {
-    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
-        "image/jpeg"
-    } else if data.len() >= 8 && &data[..8] == b"\x89PNG\r\n\x1a\n" {
-        "image/png"
-    } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        "image/webp"
-    } else if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
-        "image/gif"
+pub fn mpd_toggle_play() -> Result<(), String> {
+    let mut mpd = MpdClient::connect()?;
+    let status = parse_pairs(&mpd.command("status")?);
+    if status.get("state").is_some_and(|s| s == "play") {
+        mpd.command("pause 1")?;
     } else {
-        "image/jpeg" // best guess
+        mpd.command("play")?;
     }
+    Ok(())
 }
 
-#[tauri::command]
-fn get_album_art(path: String) -> Result<AlbumArt, String> {
+pub fn mpd_stop() -> Result<(), String> {
+    MpdClient::connect()?.command("stop")?;
+    Ok(())
+}
+
+pub fn mpd_next() -> Result<(), String> {
+    MpdClient::connect()?.command("next")?;
+    Ok(())
+}
+
+pub fn mpd_previous() -> Result<(), String> {
+    MpdClient::connect()?.command("previous")?;
+    Ok(())
+}
+
+pub fn mpd_set_volume(volume: u32) -> Result<(), String> {
+    MpdClient::connect()?.command(&format!("setvol {}", volume.min(100)))?;
+    Ok(())
+}
+
+pub fn mpd_seek_current(seconds: u32) -> Result<(), String> {
+    MpdClient::connect()?.command(&format!("seekcur {seconds}"))?;
+    Ok(())
+}
+
+pub fn get_album_art(path: String) -> Result<AlbumArt, String> {
     let mut mpd = MpdClient::connect()?;
     let data = mpd.album_art(&path)?;
     let mime = detect_mime(&data).to_string();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-    Ok(AlbumArt { mime, data: b64 })
+    Ok(AlbumArt { mime, data })
+}
+
+pub fn get_albums() -> Result<Vec<AlbumSummary>, String> {
+    Ok(summarize_albums(&get_library()?))
+}
+
+pub fn get_album_tracks(album_artist: String, album: String) -> Result<Vec<Track>, String> {
+    let mut mpd = MpdClient::connect()?;
+    let cmd = format!(
+        "find albumartist {} album {}",
+        quote_arg(&album_artist),
+        quote_arg(&album)
+    );
+    let lines = mpd.command(&cmd)?;
+    Ok(parse_tracks(&lines))
+}
+
+fn disconnected_status(error: String) -> MpdStatus {
+    MpdStatus {
+        connected: false,
+        state: "stop".to_string(),
+        elapsed: 0,
+        duration: 0,
+        volume: -1,
+        file: String::new(),
+        title: String::new(),
+        artist: String::new(),
+        album: String::new(),
+        error,
+        song: -1,
+        playlist_version: 0,
+        playlist_length: 0,
+        repeat: false,
+        random: false,
+    }
 }
 
 fn play_paths(mpd: &mut MpdClient, paths: &[String], index: usize) -> Result<(), String> {
@@ -399,107 +345,6 @@ fn play_paths(mpd: &mut MpdClient, paths: &[String], index: usize) -> Result<(),
     Ok(())
 }
 
-#[tauri::command]
-fn mpd_toggle_play() -> Result<(), String> {
-    let mut mpd = MpdClient::connect()?;
-    let status = parse_pairs(&mpd.command("status")?);
-    if status.get("state").is_some_and(|s| s == "play") {
-        mpd.command("pause 1")?;
-    } else {
-        mpd.command("play")?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn mpd_stop() -> Result<(), String> {
-    MpdClient::connect()?.command("stop")?;
-    Ok(())
-}
-
-#[tauri::command]
-fn mpd_next() -> Result<(), String> {
-    MpdClient::connect()?.command("next")?;
-    Ok(())
-}
-
-#[tauri::command]
-fn mpd_previous() -> Result<(), String> {
-    MpdClient::connect()?.command("previous")?;
-    Ok(())
-}
-
-#[tauri::command]
-fn mpd_set_volume(volume: u32) -> Result<(), String> {
-    let volume = volume.min(100);
-    MpdClient::connect()?.command(&format!("setvol {volume}"))?;
-    Ok(())
-}
-
-#[tauri::command]
-fn mpd_seek_current(seconds: u32) -> Result<(), String> {
-    MpdClient::connect()?.command(&format!("seekcur {seconds}"))?;
-    Ok(())
-}
-
-#[tauri::command]
-fn window_minimize(app: tauri::AppHandle) -> Result<(), String> {
-    app.get_webview_window("main")
-        .ok_or_else(|| "main window not found".to_string())?
-        .minimize()
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn window_toggle_maximize(app: tauri::AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window not found".to_string())?;
-    if window.is_maximized().map_err(|e| e.to_string())? {
-        window.unmaximize().map_err(|e| e.to_string())
-    } else {
-        window.maximize().map_err(|e| e.to_string())
-    }
-}
-
-#[tauri::command]
-fn window_close(app: tauri::AppHandle) -> Result<(), String> {
-    app.get_webview_window("main")
-        .ok_or_else(|| "main window not found".to_string())?
-        .close()
-        .map_err(|e| e.to_string())
-}
-
-fn load_mpd_library() -> Result<Vec<Track>, String> {
-    let mut mpd = MpdClient::connect()?;
-    let lines = mpd.command("listallinfo")?;
-    Ok(parse_tracks(&lines))
-}
-
-// Album summary list. MPD 0.24 rejects multi-tag `list` queries (e.g.
-// `list albumartist album date` returns ACK), so we derive this from
-// `listallinfo` like the UI's `deriveCollections` does. The IPC contract
-// is preserved: the caller gets a deduplicated list of (album, artist).
-#[tauri::command]
-fn get_albums() -> Result<Vec<AlbumSummary>, String> {
-    let mut mpd = MpdClient::connect()?;
-    let lines = mpd.command("listallinfo")?;
-    Ok(summarize_albums(&parse_tracks(&lines)))
-}
-
-// Tracks for a specific album. `find albumartist "X" album "Y"` is O(album)
-// and returns a small response.
-#[tauri::command]
-fn get_album_tracks(album_artist: String, album: String) -> Result<Vec<Track>, String> {
-    let mut mpd = MpdClient::connect()?;
-    let cmd = format!(
-        "find albumartist {} album {}",
-        quote_arg(&album_artist),
-        quote_arg(&album)
-    );
-    let lines = mpd.command(&cmd)?;
-    Ok(parse_tracks(&lines))
-}
 fn read_mpd_status() -> Result<MpdStatus, String> {
     let mut mpd = MpdClient::connect()?;
     let status = parse_pairs(&mpd.command("status")?);
@@ -513,9 +358,13 @@ fn read_mpd_status() -> Result<MpdStatus, String> {
         .or_else(|| song.get("duration"))
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(0.0) as u32;
+
     Ok(MpdStatus {
         connected: true,
-        state: status.get("state").cloned().unwrap_or_else(|| "stop".to_string()),
+        state: status
+            .get("state")
+            .cloned()
+            .unwrap_or_else(|| "stop".to_string()),
         elapsed,
         duration,
         volume: status.get("volume").and_then(|v| v.parse().ok()).unwrap_or(-1),
@@ -523,12 +372,16 @@ fn read_mpd_status() -> Result<MpdStatus, String> {
         title: song.get("Title").cloned().unwrap_or_default(),
         artist: song.get("Artist").cloned().unwrap_or_default(),
         album: song.get("Album").cloned().unwrap_or_default(),
-        // MPD's `error` field is sticky (e.g. "Failed to enable output
-        // ..."); surface it so the UI can show why audio isn't playing.
         error: status.get("error").cloned().unwrap_or_default(),
         song: status.get("song").and_then(|v| v.parse().ok()).unwrap_or(-1),
-        playlist_version: status.get("playlist").and_then(|v| v.parse().ok()).unwrap_or(0),
-        playlist_length: status.get("playlistlength").and_then(|v| v.parse().ok()).unwrap_or(0),
+        playlist_version: status
+            .get("playlist")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        playlist_length: status
+            .get("playlistlength")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         repeat: status.get("repeat").map(|v| v == "1").unwrap_or(false),
         random: status.get("random").map(|v| v == "1").unwrap_or(false),
     })
@@ -582,14 +435,22 @@ fn track_from_pairs(pairs: &[(String, String)]) -> Option<Track> {
         .map(|v| format_duration(v as u32))
         .unwrap_or_else(|| "0:00".to_string());
 
-    Some(Track { title, artist, album, album_artist, genre, year, track_number, duration, path })
+    Some(Track {
+        title,
+        artist,
+        album,
+        album_artist,
+        genre,
+        year,
+        track_number,
+        duration,
+        path,
+    })
 }
 
-// Deduplicate (album, album_artist) pairs from a track list. Multi-disc
-// releases share a single album name and collapse to one entry.
 fn summarize_albums(tracks: &[Track]) -> Vec<AlbumSummary> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out: Vec<AlbumSummary> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
     for t in tracks {
         let key = format!("{}\u{0001}{}", t.album, t.album_artist);
         if seen.insert(key) {
@@ -603,7 +464,7 @@ fn summarize_albums(tracks: &[Track]) -> Vec<AlbumSummary> {
     out
 }
 
-fn parse_pairs(lines: &[String]) -> std::collections::HashMap<String, String> {
+fn parse_pairs(lines: &[String]) -> HashMap<String, String> {
     lines
         .iter()
         .filter_map(|line| line.split_once(": "))
@@ -612,25 +473,18 @@ fn parse_pairs(lines: &[String]) -> std::collections::HashMap<String, String> {
 }
 
 fn mpd_addr() -> String {
-    // Default to IPv4 loopback. On some systems `localhost` resolves to
-    // `::1` (IPv6) first, and MPD often only binds to 0.0.0.0 (IPv4),
-    // so we'd silently fail to connect. 127.0.0.1 is unambiguous.
     let host = env::var("MPD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("MPD_PORT").unwrap_or_else(|_| "6600".to_string());
 
-    // [::1]:6600 or host:port — already complete
     if host.contains("]:") || (!host.contains("::") && host.contains(':')) {
         return host;
     }
-    // Bare IPv6 address — wrap in brackets, append port
     if host.contains("::") && !host.starts_with('[') {
         return format!("[{}]:{}", host, port);
     }
-    // Bracketed IPv6 without port: [::1] → [::1]:6600
     if host.starts_with('[') && !host.contains("]:") {
         return format!("{}:{}", host, port);
     }
-    // Plain IPv4 or hostname — append default port
     format!("{}:{}", host, port)
 }
 
@@ -654,35 +508,16 @@ fn title_from_path(path: &str) -> String {
         .to_string()
 }
 
-
-pub fn run() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            get_library,
-            get_mpd_status,
-            mpd_play_path,
-            mpd_play_paths,
-            mpd_set_queue,
-            mpd_clear_queue,
-            mpd_play_idx,
-            mpd_delete_from_queue,
-            mpd_enqueue,
-            get_queue,
-            mpd_set_repeat,
-            mpd_set_random,
-            get_albums,
-            get_album_tracks,
-            mpd_toggle_play,
-            get_album_art,
-            mpd_stop,
-            mpd_next,
-            mpd_previous,
-            mpd_set_volume,
-            mpd_seek_current,
-            window_minimize,
-            window_toggle_maximize,
-            window_close
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+fn detect_mime(data: &[u8]) -> &'static str {
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        "image/jpeg"
+    } else if data.len() >= 8 && &data[..8] == b"\x89PNG\r\n\x1a\n" {
+        "image/png"
+    } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        "image/webp"
+    } else if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
+        "image/gif"
+    } else {
+        "image/jpeg"
+    }
 }
