@@ -1044,6 +1044,19 @@
       el.textContent = connected ? "MPD 127.0.0.1:6600" : "MPD disconnected";
       el.title = connected ? "Connected to MPD on 127.0.0.1:6600" : message;
     }
+    if (banner) {
+      // Three states: disconnected (red), connected-with-MPD-error (yellow),
+      // and connected-OK (hidden). MPD's `error` field is sticky — e.g.
+      // "Failed to enable output" — so we surface it as a banner instead
+      // of silently keeping the app in a "playing but no sound" state.
+      banner.classList.toggle("disconnected", !connected);
+      banner.classList.toggle("error", connected && !!detail);
+      if (!connected) {
+        banner.textContent = "MPD disconnected: " + message;
+      } else if (detail) {
+        banner.textContent = "MPD audio error: " + detail;
+      }
+    }
   }
 
   // ---- Volume / seekbar ---------------------------------------------------

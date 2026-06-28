@@ -137,6 +137,7 @@ button { font-family: inherit; font-size: inherit; }
 .ctx-input::placeholder { color: var(--text-dim); }
 .mpd-banner { display: none; align-items: center; min-height: 28px; padding: 5px 12px; border-top: 1px solid rgba(255,255,255,.06); border-bottom: 1px solid #141414; font-weight: 600; flex: 0 0 auto; }
 .mpd-banner.disconnected { display: flex; background: linear-gradient(to bottom, #5C332B, #3A211D); color: #FFD8CE; text-shadow: 0 1px 0 #000; }
+.mpd-banner.error { display: flex; background: linear-gradient(to bottom, #5C4A1F, #3A2D14); color: #FFE9B0; text-shadow: 0 1px 0 #000; }
 .mpd-banner.connected { display: none; }
 
 /* =====================================================

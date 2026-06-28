@@ -42,6 +42,11 @@ pub struct AlbumSummary {
 
 struct MpdClient {
     stream: TcpStream,
+    // Persistent buffered reader. MPD only sends data after a command, so
+    // the BufReader's pre-fill is bounded by MPD's response for one
+    // command; reading the same reader across calls preserves any bytes
+    // MPD sent between OK and the next read.
+    reader: BufReader<TcpStream>,
 }
 
 impl MpdClient {
@@ -56,11 +61,15 @@ impl MpdClient {
         stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
-        let mut client = Self { stream };
-        let greeting = client.read_response()?;
-        if !greeting.first().is_some_and(|line| line.starts_with("OK MPD")) {
-            return Err("MPD did not send a valid greeting".to_string());
+        let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|e| format!("MPD read failed: {e}"))?;
+        let greeting = line.trim_end_matches(['\r', '\n']).to_string();
+        if !greeting.starts_with("OK MPD") {
+            return Err(format!("MPD did not send a valid greeting: {greeting}"));
         }
+
+        let mut client = Self { stream, reader };
         if let Some(password) = password {
             client.command(&format!("password {}", quote_arg(&password)))?;
         }
@@ -75,12 +84,10 @@ impl MpdClient {
     }
 
     fn read_response(&mut self) -> Result<Vec<String>, String> {
-        let cloned = self.stream.try_clone().map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(cloned);
         let mut out = Vec::new();
         loop {
             let mut line = String::new();
-            let bytes = reader.read_line(&mut line).map_err(|e| format!("MPD read failed: {e}"))?;
+            let bytes = self.reader.read_line(&mut line).map_err(|e| format!("MPD read failed: {e}"))?;
             if bytes == 0 {
                 return Err("MPD closed the connection".to_string());
             }
@@ -99,8 +106,10 @@ impl MpdClient {
 
 impl MpdClient {
     /// Fetch album art binary data via MPD's `albumart` protocol.
-    /// The response is: `size: TOTAL\nbinary: CHUNK\n<data>\n...` (chunked), then `OK\n`.
-    /// Reads text lines byte-by-byte to avoid BufReader pre-buffering binary data.
+    /// Response: `size: TOTAL\nbinary: CHUNK\n<data>\n...` (chunked), then `OK\n`.
+    /// All reads go through the persistent `reader` so the same buffered
+    /// stream is shared with `read_response` (binary data must not be
+    /// pre-buffered separately on a different handle).
     fn album_art(&mut self, uri: &str) -> Result<Vec<u8>, String> {
         // MPD requires both URI and offset
         let cmd = format!("albumart {} 0\n", quote_arg(uri));
@@ -127,7 +136,7 @@ impl MpdClient {
         }
 
         // Read "size: N" line (total size of all binary data)
-        let size_line = read_line(&mut self.stream)?;
+        let size_line = read_line(&mut self.reader)?;
         if size_line.starts_with("ACK") {
             return Err(size_line);
         }
@@ -140,7 +149,7 @@ impl MpdClient {
         // Read chunks until we have `total` bytes
         while data.len() < total {
             // Read "binary: CHUNK_SIZE" line
-            let chunk_header = read_line(&mut self.stream)?;
+            let chunk_header = read_line(&mut self.reader)?;
             if chunk_header.starts_with("ACK") {
                 return Err(chunk_header);
             }
@@ -151,14 +160,14 @@ impl MpdClient {
 
             // Read exactly `chunk_size` raw bytes
             let mut chunk = vec![0u8; chunk_size];
-            self.stream
+            self.reader
                 .read_exact(&mut chunk)
                 .map_err(|e| format!("MPD album art read error: {e}"))?;
             data.extend_from_slice(&chunk);
         }
 
         // Read the trailing "OK" line
-        let ok_line = read_line(&mut self.stream)?;
+        let ok_line = read_line(&mut self.reader)?;
         if ok_line != "OK" {
             return Err(format!("Expected OK after album art, got: {ok_line}"));
         }
@@ -207,17 +216,17 @@ fn mpd_play_paths(paths: Vec<String>, index: usize) -> Result<(), String> {
 }
 
 /// Replace MPD's queue with these paths and start playing at `index`.
-/// Caps the payload at `MAX_QUEUE_TRACKS` to keep IPC under control.
+/// MPD handles queues in the thousands, so we don't cap the path count
+/// (capping to 500 silently clamped `index` to a different track when
+/// the user picked a song past the cap).
 #[tauri::command]
 fn mpd_set_queue(paths: Vec<String>, index: usize) -> Result<(), String> {
     if paths.is_empty() {
         return Err("No tracks were sent to MPD".to_string());
     }
-    // Hard cap: MPD handles queues in the thousands, but IPC payload size
-    // should stay bounded. 500 covers any album + sensible auto-DJ.
-    let capped: Vec<String> = paths.iter().take(500).cloned().collect();
     let mut mpd = MpdClient::connect()?;
-    play_paths(&mut mpd, &capped, index.min(capped.len().saturating_sub(1)))
+    let index = index.min(paths.len() - 1);
+    play_paths(&mut mpd, &paths, index)
 }
 
 #[tauri::command]
@@ -357,14 +366,15 @@ fn load_mpd_library() -> Result<Vec<Track>, String> {
     Ok(parse_tracks(&lines))
 }
 
-// Lightweight album list. `list albumartist album date` is O(albums) and
-// returns a few hundred lines even for a 5000-track library, so this
-// loads in <1s instead of the 10s+ that listallinfo takes.
+// Album summary list. MPD 0.24 rejects multi-tag `list` queries (e.g.
+// `list albumartist album date` returns ACK), so we derive this from
+// `listallinfo` like the UI's `deriveCollections` does. The IPC contract
+// is preserved: the caller gets a deduplicated list of (album, artist).
 #[tauri::command]
 fn get_albums() -> Result<Vec<AlbumSummary>, String> {
     let mut mpd = MpdClient::connect()?;
-    let lines = mpd.command("list albumartist album date")?;
-    Ok(parse_albums(&lines))
+    let lines = mpd.command("listallinfo")?;
+    Ok(summarize_albums(&parse_tracks(&lines)))
 }
 
 // Tracks for a specific album. `find albumartist "X" album "Y"` is O(album)
@@ -380,7 +390,6 @@ fn get_album_tracks(album_artist: String, album: String) -> Result<Vec<Track>, S
     let lines = mpd.command(&cmd)?;
     Ok(parse_tracks(&lines))
 }
-
 fn read_mpd_status() -> Result<MpdStatus, String> {
     let mut mpd = MpdClient::connect()?;
     let status = parse_pairs(&mpd.command("status")?);
@@ -404,7 +413,9 @@ fn read_mpd_status() -> Result<MpdStatus, String> {
         title: song.get("Title").cloned().unwrap_or_default(),
         artist: song.get("Artist").cloned().unwrap_or_default(),
         album: song.get("Album").cloned().unwrap_or_default(),
-        error: String::new(),
+        // MPD's `error` field is sticky (e.g. "Failed to enable output
+        // ..."); surface it so the UI can show why audio isn't playing.
+        error: status.get("error").cloned().unwrap_or_default(),
     })
 }
 
@@ -433,45 +444,6 @@ fn parse_tracks(lines: &[String]) -> Vec<Track> {
     tracks
 }
 
-// Parse `list albumartist album date` output. MPD emits one group of
-// three lines per album; we keep the first occurrence of each album
-// (albums with multiple discs are collapsed into one entry).
-fn parse_albums(lines: &[String]) -> Vec<AlbumSummary> {
-    let mut out: Vec<AlbumSummary> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut aa = String::new();
-    let mut al = String::new();
-    let mut yr: u32 = 0;
-    for line in lines {
-        if line == "OK" || line.starts_with("OK MPD") { break; }
-        if let Some(v) = line.strip_prefix("AlbumArtist: ") {
-            aa = v.to_string();
-        } else if let Some(v) = line.strip_prefix("Album: ") {
-            al = v.to_string();
-        } else if let Some(v) = line.strip_prefix("Date: ") {
-            yr = v.chars().take(4).collect::<String>().parse().unwrap_or(0);
-        } else if line == "AlbumArtistSort: " || line.starts_with("AlbumArtistSort: ")
-            || line.starts_with("AlbumSort: ") || line.starts_with("MusicBrainz_") {
-            // skip sorting / MBz lines; they don't end a group
-        } else if !al.is_empty() {
-            // New group starts — flush the previous one
-            let key = format!("{}\u{0001}{}", al, aa);
-            if !seen.contains(&key) {
-                seen.insert(key);
-                out.push(AlbumSummary { album: al.clone(), album_artist: aa.clone(), year: yr });
-            }
-            al.clear();
-        }
-    }
-    if !al.is_empty() {
-        let key = format!("{}\u{0001}{}", al, aa);
-        if !seen.contains(&key) {
-            out.push(AlbumSummary { album: al, album_artist: aa, year: yr });
-        }
-    }
-    out
-}
-
 fn track_from_pairs(pairs: &[(String, String)]) -> Option<Track> {
     let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
     let path = get("file")?;
@@ -496,6 +468,24 @@ fn track_from_pairs(pairs: &[(String, String)]) -> Option<Track> {
         .unwrap_or_else(|| "0:00".to_string());
 
     Some(Track { title, artist, album, album_artist, genre, year, track_number, duration, path })
+}
+
+// Deduplicate (album, album_artist) pairs from a track list. Multi-disc
+// releases share a single album name and collapse to one entry.
+fn summarize_albums(tracks: &[Track]) -> Vec<AlbumSummary> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<AlbumSummary> = Vec::new();
+    for t in tracks {
+        let key = format!("{}\u{0001}{}", t.album, t.album_artist);
+        if seen.insert(key) {
+            out.push(AlbumSummary {
+                album: t.album.clone(),
+                album_artist: t.album_artist.clone(),
+                year: t.year,
+            });
+        }
+    }
+    out
 }
 
 fn parse_pairs(lines: &[String]) -> std::collections::HashMap<String, String> {
