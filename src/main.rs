@@ -10,6 +10,8 @@ use std::time::Duration;
 const TRACK_RENDER_LIMIT: usize = 1_200;
 
 pub fn main() -> iced::Result {
+    prefer_x11_on_linux();
+
     application(boot, update, view)
         .title("MusicBee Iced")
         .theme(Theme::Dark)
@@ -18,6 +20,21 @@ pub fn main() -> iced::Result {
         .centered()
         .run()
 }
+
+#[cfg(target_os = "linux")]
+fn prefer_x11_on_linux() {
+    // Winit prefers Wayland when WAYLAND_DISPLAY is set. On machines with a
+    // partial Wayland environment but no libwayland-client installed, iced can
+    // panic during event-loop creation with `NoWaylandLib`. This app does not
+    // require Wayland-specific behavior, so default to X11. Users who do want
+    // Wayland can still override this with `WINIT_UNIX_BACKEND=wayland`.
+    if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefer_x11_on_linux() {}
 
 #[derive(Debug, Clone)]
 enum Message {

@@ -15,7 +15,6 @@
           pkgs.fontconfig
           pkgs.libxkbcommon
           pkgs.vulkan-loader
-          pkgs.wayland
           pkgs.xorg.libX11
           pkgs.xorg.libXcursor
           pkgs.xorg.libXi
@@ -23,7 +22,7 @@
           pkgs.dbus
         ];
         shellHook = ''
-          echo "iced devShell ready: provides winit/wgpu desktop runtime deps."
+          echo "iced devShell ready: provides X11/winit/wgpu desktop runtime deps."
         '';
       };
     };
