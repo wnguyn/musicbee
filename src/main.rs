@@ -37,50 +37,63 @@ const W_RATING: Length = Length::Fixed(78.0);
 const W_PLAYS: Length = Length::Fixed(48.0);
 const W_TIME: Length = Length::Fixed(58.0);
 
+// Top-level navigator. Browsing (albums/artists/genres/songs) lives inside
+// the Library home, driven by the sidebar, so the navigator stays small.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Music,
-    AlbumsArtists,
-    Artists,
-    Albums,
-    Genres,
-    Folders,
-    Playlists,
     NowPlaying,
     Queue,
 }
 
-const NAV_TABS: [(View, &str, &str, u32); 9] = [
-    (View::Music, "\u{266B}", "Music", 0x2A6BC4),
-    (View::AlbumsArtists, "\u{25A6}", "Albums & Artists", 0x2E8B7A),
-    (View::Artists, "\u{25CF}", "Artists", 0x8E44AD),
-    (View::Albums, "\u{25A4}", "Albums", 0xD98A1E),
-    (View::Genres, "\u{266F}", "Genres", 0x5B9C3D),
-    (View::Folders, "\u{25A3}", "Folders", 0x7A7A7A),
-    (View::Playlists, "\u{2261}", "Playlists", 0xD9661E),
+const NAV_TABS: [(View, &str, &str, u32); 3] = [
+    (View::Music, "\u{266B}", "Library", 0x2A6BC4),
     (View::NowPlaying, "\u{25BA}", "Now Playing", 0xC8402E),
     (View::Queue, "\u{2263}", "Queue", 0x6B7AB8),
 ];
 
-fn view_title(v: View) -> &'static str {
-    NAV_TABS
-        .iter()
-        .find(|(view, ..)| *view == v)
-        .map(|(_, _, label, _)| *label)
-        .unwrap_or("Music")
+// Library home sections, selected from the left sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Albums,
+    Artists,
+    Genres,
+    Songs,
+    Folders,
+    Playlists,
+}
+
+const SECTIONS: [(Section, &str, &str); 6] = [
+    (Section::Albums, "\u{25A4}", "Albums"),
+    (Section::Artists, "\u{25CF}", "Artists"),
+    (Section::Genres, "\u{266F}", "Genres"),
+    (Section::Songs, "\u{266B}", "Songs"),
+    (Section::Folders, "\u{25A3}", "Folders"),
+    (Section::Playlists, "\u{2261}", "Playlists"),
+];
+
+fn view_title(app: &App) -> String {
+    match app.view.0 {
+        View::NowPlaying => "Now Playing".to_string(),
+        View::Queue => "Queue".to_string(),
+        View::Music => match app.section.0 {
+            Section::Albums => "Albums".to_string(),
+            Section::Artists => app
+                .open_artist
+                .clone()
+                .unwrap_or_else(|| "Artists".to_string()),
+            Section::Genres => "Genres".to_string(),
+            Section::Songs => "Songs".to_string(),
+            Section::Folders => "Folders".to_string(),
+            Section::Playlists => "Playlists".to_string(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layout {
     Details,
     Grouped,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NpTab {
-    Playing,
-    Lyrics,
-    Info,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +123,7 @@ struct App {
     tracks: Vec<Track>,
     meta: Vec<TrackMeta>,
     view: ViewState,
+    section: SectionState,
     search: String,
     quick_title: String,
     quick_artist: String,
@@ -124,16 +138,16 @@ struct App {
     shuffle: bool,
     repeat: bool,
     layout: LayoutState,
-    np_tab: NpTabState,
     album_art: HashMap<String, Option<image::Handle>>,
+    artist_art: HashMap<String, Option<image::Handle>>,
     requested_art: HashSet<String>,
-    art_pending: VecDeque<String>,
+    art_pending: VecDeque<ArtJob>,
     art_inflight: usize,
     albums: Vec<Album>,
     artists: Vec<ArtistRow>,
     genres: Vec<(String, usize)>,
     folders: Vec<String>,
-    sel_artist: Option<String>,
+    open_artist: Option<String>,
     sel_genre: Option<String>,
     sel_folder: Option<String>,
     sel_album: Option<usize>,
@@ -143,12 +157,33 @@ struct App {
     seek_preview: Option<u32>,
 }
 
+// A pending artwork fetch. Albums carry the metadata needed for the Last.fm
+// fallback; artists are fetched from Last.fm by name.
+#[derive(Debug, Clone)]
+enum ArtJob {
+    Album {
+        path: String,
+        album_artist: String,
+        album: String,
+    },
+    Artist {
+        name: String,
+    },
+}
+
 // Newtype wrappers so we can derive Default on App.
 #[derive(Debug)]
 struct ViewState(View);
 impl Default for ViewState {
     fn default() -> Self {
-        ViewState(View::Albums)
+        ViewState(View::Music)
+    }
+}
+#[derive(Debug)]
+struct SectionState(Section);
+impl Default for SectionState {
+    fn default() -> Self {
+        SectionState(Section::Albums)
     }
 }
 #[derive(Debug)]
@@ -158,20 +193,13 @@ impl Default for LayoutState {
         LayoutState(Layout::Grouped)
     }
 }
-#[derive(Debug)]
-struct NpTabState(NpTab);
-impl Default for NpTabState {
-    fn default() -> Self {
-        NpTabState(NpTab::Playing)
-    }
-}
-
 #[derive(Debug, Clone)]
 enum Message {
     LibraryLoaded(Result<Vec<Track>, String>),
     StatusLoaded(MpdStatus),
     QueueLoaded(Result<Vec<Track>, String>),
     AlbumArtLoaded(String, Result<AlbumArt, String>),
+    ArtistArtLoaded(String, Result<AlbumArt, String>),
     CommandFinished(Result<(), String>),
     SearchChanged(String),
     QuickTitle(String),
@@ -179,15 +207,16 @@ enum Message {
     QuickAlbum(String),
     Tick,
     SelectView(View),
+    SetSection(Section),
+    OpenArtist(String),
+    CloseArtist,
     SelectTrack(usize),
     PlayTrack(usize),
-    SelectArtist(String),
     SelectGenre(String),
     SelectFolder(String),
     SelectAlbum(usize),
     PlayAlbum(usize),
     SetLayout(Layout),
-    SetNpTab(NpTab),
     PlayQueueIndex(usize),
     RemoveFromQueue(usize),
     ClearQueue,
@@ -262,13 +291,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     if app.sel_album.is_none() && !app.albums.is_empty() {
                         app.sel_album = Some(0);
                     }
-                    // Begin streaming album covers for every album.
-                    let cover_paths: Vec<String> = app
-                        .albums
-                        .iter()
-                        .filter_map(|a| a.tracks.first().map(|&i| app.tracks[i].path.clone()))
-                        .collect();
-                    app.queue_art(cover_paths);
+                    // Begin streaming covers for every album.
+                    for i in 0..app.albums.len() {
+                        app.queue_album_cover(i);
+                    }
                     Task::batch([app.sync_current_from_status(), app.pump_art()])
                 }
                 Err(error) => {
@@ -316,6 +342,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.art_inflight = app.art_inflight.saturating_sub(1);
             app.pump_art()
         }
+        Message::ArtistArtLoaded(name, result) => {
+            let handle = result.ok().map(|art| image::Handle::from_bytes(art.data));
+            app.artist_art.insert(name, handle);
+            app.art_inflight = app.art_inflight.saturating_sub(1);
+            app.pump_art()
+        }
         Message::CommandFinished(result) => {
             if let Err(error) = result {
                 app.error = Some(error);
@@ -343,6 +375,42 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.view = ViewState(v);
             Task::none()
         }
+        Message::SetSection(section) => {
+            app.section = SectionState(section);
+            app.view = ViewState(View::Music);
+            app.open_artist = None;
+            // Lazily request artist images the first time Artists is opened.
+            if section == Section::Artists {
+                let names: Vec<String> = app.artists.iter().map(|a| a.name.clone()).collect();
+                for name in names {
+                    app.queue_artist_image(name);
+                }
+                return app.pump_art();
+            }
+            Task::none()
+        }
+        Message::OpenArtist(name) => {
+            app.open_artist = Some(name.clone());
+            // Select the artist's first album and ensure those covers load.
+            if let Some(idx) = app.albums.iter().position(|a| a.album_artist == name) {
+                app.sel_album = Some(idx);
+            }
+            let album_indices: Vec<usize> = app
+                .albums
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.album_artist == name)
+                .map(|(i, _)| i)
+                .collect();
+            for i in album_indices {
+                app.queue_album_cover(i);
+            }
+            app.pump_art()
+        }
+        Message::CloseArtist => {
+            app.open_artist = None;
+            Task::none()
+        }
         Message::SelectTrack(index) => {
             app.selected = Some(index);
             app.ensure_art_for_index(index)
@@ -359,10 +427,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             );
             Task::batch([app.ensure_art_for_index(index), task])
         }
-        Message::SelectArtist(name) => {
-            app.sel_artist = Some(name);
-            Task::none()
-        }
         Message::SelectGenre(name) => {
             app.sel_genre = Some(name);
             Task::none()
@@ -373,12 +437,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SelectAlbum(index) => {
             app.sel_album = Some(index);
-            // Make sure the selected album's tracks have art queued.
-            if let Some(album) = app.albums.get(index) {
-                let paths: Vec<String> =
-                    album.tracks.iter().map(|&i| app.tracks[i].path.clone()).collect();
-                app.queue_art(paths);
-            }
+            app.queue_album_cover(index);
             app.pump_art()
         }
         Message::PlayAlbum(index) => {
@@ -401,10 +460,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SetLayout(layout) => {
             app.layout = LayoutState(layout);
-            Task::none()
-        }
-        Message::SetNpTab(tab) => {
-            app.np_tab = NpTabState(tab);
             Task::none()
         }
         Message::PlayQueueIndex(index) => Task::perform(
@@ -470,11 +525,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 fn view(app: &App) -> Element<'_, Message> {
     let body: Element<Message> = match app.view.0 {
         View::Music => music_view(app),
-        View::Artists => selector_view(app, View::Artists),
-        View::Genres => selector_view(app, View::Genres),
-        View::Folders => selector_view(app, View::Folders),
-        View::Albums | View::AlbumsArtists => albums_view(app),
-        View::Playlists => playlists_view(app),
         View::NowPlaying => now_playing_full(app),
         View::Queue => queue_view(app),
     };
@@ -588,7 +638,7 @@ fn contextbar(app: &App) -> Element<'_, Message> {
     let left = row![
         seg,
         container(text("").size(1)).width(Length::Fixed(2.0)),
-        text(view_title(app.view.0)).size(13).color(style::rgb(0xEAEAEA)),
+        text(view_title(app)).size(13).color(style::rgb(0xEAEAEA)),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -626,79 +676,381 @@ fn seg_button(glyph: &str, active: bool, msg: Message) -> Element<'_, Message> {
     .into()
 }
 
-// ---- Music view ---------------------------------------------------------
+// ---- Library home (sidebar + section content) ---------------------------
 fn music_view(app: &App) -> Element<'_, Message> {
-    let sidebar = container(library_tree(app))
-        .width(Length::Fixed(210.0))
+    let sidebar = container(library_sidebar(app))
+        .width(Length::Fixed(190.0))
         .height(Length::Fill)
         .style(style::sidebar);
 
-    let indices = app.visible_indices();
-    let main = column![
-        quickfilter(app),
-        container(track_grid(app, &indices, app.layout.0 == Layout::Grouped))
-            .width(Length::Fill)
-            .height(Length::Fill),
-        statusbar(app, indices.len()),
-    ];
-
-    let np = container(now_playing_panel(app))
-        .width(Length::Fixed(240.0))
-        .height(Length::Fill)
-        .style(style::now_playing_panel);
+    let content: Element<Message> = match app.section.0 {
+        Section::Albums => albums_section(app),
+        Section::Artists => artists_section(app),
+        Section::Genres => genres_section(app),
+        Section::Songs => songs_section(app),
+        Section::Folders => folders_section(app),
+        Section::Playlists => playlists_view(app),
+    };
 
     row![
         sidebar,
-        container(main).width(Length::Fill).height(Length::Fill).style(style::content),
-        np,
+        container(content).width(Length::Fill).height(Length::Fill).style(style::content),
     ]
     .height(Length::Fill)
     .into()
 }
 
-fn library_tree(app: &App) -> Element<'_, Message> {
+fn library_sidebar(app: &App) -> Element<'_, Message> {
     let header = container(text("Library").size(12).color(style::rgb(style::TEXT)))
         .padding(Padding::from([6, 10]))
         .width(Length::Fill)
         .style(style::grid_header);
 
-    let items = column![
-        tree_node("\u{266B}", "Music", false, app.view.0 == View::Music, Message::SelectView(View::Music)),
-        tree_node("\u{25A4}", "Albums", true, app.view.0 == View::Albums, Message::SelectView(View::Albums)),
-        tree_node("\u{25CF}", "Artists", true, app.view.0 == View::Artists, Message::SelectView(View::Artists)),
-        tree_node("\u{266F}", "Genres", true, app.view.0 == View::Genres, Message::SelectView(View::Genres)),
-        tree_node("\u{25A3}", "Folders", false, app.view.0 == View::Folders, Message::SelectView(View::Folders)),
-        tree_node("\u{2261}", "Playlists", false, app.view.0 == View::Playlists, Message::SelectView(View::Playlists)),
-        tree_node("\u{2263}", "Queue", false, app.view.0 == View::Queue, Message::SelectView(View::Queue)),
-    ]
-    .spacing(1)
-    .padding(Padding::from([4, 4]));
+    let mut items = Column::new().spacing(2).padding(Padding::from([6, 6]));
+    for (section, icon, label) in SECTIONS.iter() {
+        let selected = app.section.0 == *section;
+        items = items.push(library_button(icon, label, selected, Message::SetSection(*section)));
+    }
 
     column![header, scrollable(items).height(Length::Fill).style(style::scroller)]
         .height(Length::Fill)
         .into()
 }
 
-fn tree_node(icon: &str, label: &str, indent: bool, selected: bool, msg: Message) -> Element<'static, Message> {
-    let pad_left = if indent { 24.0 } else { 6.0 };
+fn library_button(icon: &str, label: &str, selected: bool, msg: Message) -> Element<'static, Message> {
     button(
         row![
-            text(icon.to_string()).size(12).width(Length::Fixed(16.0)),
-            text(label.to_string()).size(12),
+            text(icon.to_string()).size(13).width(Length::Fixed(18.0)),
+            text(label.to_string()).size(13),
         ]
-        .spacing(4)
+        .spacing(6)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding(Padding {
-        top: 3.0,
-        right: 6.0,
-        bottom: 3.0,
-        left: pad_left,
-    })
+    .padding(Padding::from([6, 10]))
     .on_press(msg)
     .style(move |_t, s| style::list_item(s, selected))
     .into()
+}
+
+// Albums section: cover grid on the left, selected-album detail on the right.
+fn albums_section(app: &App) -> Element<'_, Message> {
+    let needle = app.search.trim().to_lowercase();
+    let shown: Vec<usize> = app
+        .albums
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            needle.is_empty()
+                || a.album.to_lowercase().contains(&needle)
+                || a.album_artist.to_lowercase().contains(&needle)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    let header = section_header("Albums", &format!("{} albums", shown.len()));
+    let left = container(column![
+        header,
+        scrollable(cover_grid(app, &shown, 4)).width(Length::Fill).height(Length::Fill).style(style::scroller),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    let right = container(album_detail(app))
+        .width(Length::Fixed(360.0))
+        .height(Length::Fill)
+        .style(style::now_playing_panel);
+
+    row![left, right].height(Length::Fill).into()
+}
+
+// Artists section: a grid of artist images, or one artist's albums when opened.
+fn artists_section(app: &App) -> Element<'_, Message> {
+    if let Some(name) = app.open_artist.clone() {
+        return artist_detail(app, &name);
+    }
+
+    let needle = app.search.trim().to_lowercase();
+    let shown: Vec<&ArtistRow> = app
+        .artists
+        .iter()
+        .filter(|a| needle.is_empty() || a.name.to_lowercase().contains(&needle))
+        .collect();
+
+    let header = section_header("Artists", &format!("{} artists", shown.len()));
+
+    const PER_ROW: usize = 5;
+    let mut grid = Column::new().spacing(16).padding(14);
+    let mut current_row = Row::new().spacing(14);
+    let mut in_row = 0;
+    for a in &shown {
+        current_row = current_row.push(artist_card(app, a));
+        in_row += 1;
+        if in_row == PER_ROW {
+            grid = grid.push(current_row);
+            current_row = Row::new().spacing(14);
+            in_row = 0;
+        }
+    }
+    if in_row > 0 {
+        for _ in in_row..PER_ROW {
+            current_row = current_row.push(Space::new().width(Length::FillPortion(1)));
+        }
+        grid = grid.push(current_row);
+    }
+
+    column![
+        header,
+        scrollable(grid).width(Length::Fill).height(Length::Fill).style(style::scroller),
+    ]
+    .height(Length::Fill)
+    .into()
+}
+
+fn artist_detail<'a>(app: &'a App, name: &str) -> Element<'a, Message> {
+    let album_indices: Vec<usize> = app
+        .albums
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.album_artist == name)
+        .map(|(i, _)| i)
+        .collect();
+
+    let header = container(
+        row![
+            button(text("\u{2190} Artists").size(12))
+                .padding(Padding::from([4, 10]))
+                .on_press(Message::CloseArtist)
+                .style(|_t, s| style::toolbar_btn(s, false)),
+            artist_avatar(app, name, 64.0),
+            column![
+                text(name.to_string()).size(18).color(style::rgb(style::TEXT)).wrapping(Wrapping::None),
+                text(format!("{} albums", album_indices.len())).size(12).color(style::rgb(style::TEXT_DIM)),
+            ]
+            .spacing(2),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .padding(Padding::from([8, 12])),
+    )
+    .width(Length::Fill)
+    .style(style::grid_header);
+
+    let left = container(column![
+        header,
+        scrollable(cover_grid(app, &album_indices, 4)).width(Length::Fill).height(Length::Fill).style(style::scroller),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    let right = container(album_detail(app))
+        .width(Length::Fixed(360.0))
+        .height(Length::Fill)
+        .style(style::now_playing_panel);
+
+    row![left, right].height(Length::Fill).into()
+}
+
+// Genres section: a row of genre chips that filters an album grid.
+fn genres_section(app: &App) -> Element<'_, Message> {
+    let mut chips = Row::new().spacing(6);
+    chips = chips.push(genre_chip("All", app.sel_genre.is_none(), Message::SelectGenre("*".to_string())));
+    for (name, _count) in &app.genres {
+        if name.is_empty() {
+            continue;
+        }
+        let selected = app.sel_genre.as_deref() == Some(name.as_str());
+        chips = chips.push(genre_chip(name, selected, Message::SelectGenre(name.clone())));
+    }
+
+    let active = app.sel_genre.clone().filter(|g| g != "*");
+    let shown: Vec<usize> = app
+        .albums
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| active.as_deref().map(|g| a.genre == g).unwrap_or(true))
+        .map(|(i, _)| i)
+        .collect();
+
+    let header = container(
+        column![
+            row![
+                text("Genres").size(13).color(style::rgb(style::TEXT)),
+                text(format!("   {} albums", shown.len())).size(11).color(style::rgb(style::TEXT_DIM)),
+            ]
+            .align_y(Alignment::Center),
+            scrollable(chips).width(Length::Fill),
+        ]
+        .spacing(6)
+        .padding(Padding::from([6, 10])),
+    )
+    .width(Length::Fill)
+    .style(style::grid_header);
+
+    let left = container(column![
+        header,
+        scrollable(cover_grid(app, &shown, 4)).width(Length::Fill).height(Length::Fill).style(style::scroller),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    let right = container(album_detail(app))
+        .width(Length::Fixed(360.0))
+        .height(Length::Fill)
+        .style(style::now_playing_panel);
+
+    row![left, right].height(Length::Fill).into()
+}
+
+fn genre_chip(label: &str, selected: bool, msg: Message) -> Element<'static, Message> {
+    button(text(label.to_string()).size(11))
+        .padding(Padding::from([4, 10]))
+        .on_press(msg)
+        .style(move |_t, s| style::toggle_btn(s, selected))
+        .into()
+}
+
+// Songs section: the flat track list (capped) with quick filters.
+fn songs_section(app: &App) -> Element<'_, Message> {
+    let indices = app.visible_indices();
+    column![
+        quickfilter(app),
+        container(track_grid(app, &indices, app.layout.0 == Layout::Grouped))
+            .width(Length::Fill)
+            .height(Length::Fill),
+        statusbar(app, indices.len()),
+    ]
+    .height(Length::Fill)
+    .into()
+}
+
+// Folders section: directory list on the left, its tracks on the right.
+fn folders_section(app: &App) -> Element<'_, Message> {
+    let mut list = Column::new().spacing(1).padding(Padding::from([4, 4]));
+    list = list.push(list_item_btn(
+        "All Folders".to_string(),
+        app.sel_folder.is_none(),
+        Message::SelectFolder("*".to_string()),
+    ));
+    for folder in &app.folders {
+        let selected = app.sel_folder.as_deref() == Some(folder.as_str());
+        let label = folder.rsplit('/').next().unwrap_or(folder).to_string();
+        list = list.push(list_item_btn(label, selected, Message::SelectFolder(folder.clone())));
+    }
+    let left = container(column![
+        section_header("Folders", &format!("{} folders", app.folders.len())),
+        scrollable(list).height(Length::Fill).style(style::scroller),
+    ])
+    .width(Length::Fixed(240.0))
+    .height(Length::Fill)
+    .style(style::sidebar);
+
+    let indices = app.visible_indices();
+    let center = column![
+        container(track_grid(app, &indices, false)).width(Length::Fill).height(Length::Fill),
+        statusbar(app, indices.len()),
+    ];
+
+    row![left, container(center).width(Length::Fill).height(Length::Fill)]
+        .height(Length::Fill)
+        .into()
+}
+
+fn section_header<'a>(title: &str, sub: &str) -> Element<'a, Message> {
+    container(
+        row![
+            text(title.to_string()).size(13).color(style::rgb(style::TEXT)),
+            text(format!("   {sub}")).size(11).color(style::rgb(style::TEXT_DIM)),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([6, 10]))
+    .width(Length::Fill)
+    .style(style::grid_header)
+    .into()
+}
+
+// Shared album cover grid used by Albums / Artists detail / Genres.
+fn cover_grid<'a>(app: &'a App, indices: &[usize], per_row: usize) -> Element<'a, Message> {
+    let mut grid = Column::new().spacing(16).padding(14);
+    let mut current_row = Row::new().spacing(14);
+    let mut in_row = 0;
+    for &i in indices {
+        current_row = current_row.push(album_card(app, i, &app.albums[i]));
+        in_row += 1;
+        if in_row == per_row {
+            grid = grid.push(current_row);
+            current_row = Row::new().spacing(14);
+            in_row = 0;
+        }
+    }
+    if in_row > 0 {
+        for _ in in_row..per_row {
+            current_row = current_row.push(Space::new().width(Length::FillPortion(1)));
+        }
+        grid = grid.push(current_row);
+    }
+    grid.into()
+}
+
+// An artist card: image (Last.fm / first album cover / tile) + name.
+fn artist_card<'a>(app: &'a App, artist: &'a ArtistRow) -> Element<'a, Message> {
+    let card = column![
+        artist_avatar(app, &artist.name, 150.0),
+        text(artist.name.clone()).size(12).color(style::rgb(style::TEXT)).wrapping(Wrapping::None),
+        text(format!("{} albums", artist.albums)).size(10).color(style::rgb(style::TEXT_DIM)),
+    ]
+    .spacing(4)
+    .align_x(Alignment::Center)
+    .width(Length::FillPortion(1));
+
+    mouse_area(container(card).padding(2))
+        .on_press(Message::OpenArtist(artist.name.clone()))
+        .into()
+}
+
+// Artist image: Last.fm artist art, falling back to their first album cover,
+// then a coloured initial tile.
+fn artist_avatar<'a>(app: &'a App, name: &str, size: f32) -> Element<'a, Message> {
+    if let Some(Some(handle)) = app.artist_art.get(name) {
+        return container(
+            image(handle.clone())
+                .width(Length::Fixed(size))
+                .height(Length::Fixed(size))
+                .content_fit(iced::ContentFit::Cover),
+        )
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .clip(true)
+        .style(style::art_tile(style::rgb(style::BORDER_DK)))
+        .into();
+    }
+    // Fall back to the artist's first album cover if we have it.
+    if let Some(album) = app.albums.iter().find(|a| a.album_artist == name) {
+        if let Some(t) = album.tracks.first().and_then(|&i| app.tracks.get(i)) {
+            if let Some(Some(handle)) = app.album_art.get(&t.path) {
+                return container(
+                    image(handle.clone())
+                        .width(Length::Fixed(size))
+                        .height(Length::Fixed(size))
+                        .content_fit(iced::ContentFit::Cover),
+                )
+                .width(Length::Fixed(size))
+                .height(Length::Fixed(size))
+                .clip(true)
+                .style(style::art_tile(style::rgb(style::BORDER_DK)))
+                .into();
+            }
+        }
+    }
+    let (color, initial) = tile_for(name, name);
+    container(text(initial).size(size * 0.4).color(Color::from_rgba(1.0, 1.0, 1.0, 0.92)))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(style::art_tile(color))
+        .into()
 }
 
 fn quickfilter(app: &App) -> Element<'_, Message> {
@@ -899,96 +1251,6 @@ fn group_header_row<'a>(app: &'a App, key: &str, track: &'a Track) -> Element<'a
     .into()
 }
 
-// ---- Selector views (Artists / Genres / Folders) ------------------------
-fn selector_view(app: &App, which: View) -> Element<'_, Message> {
-    let (title, items): (&str, Element<Message>) = match which {
-        View::Artists => ("Artists", artist_list(app)),
-        View::Genres => ("Genres", genre_list(app)),
-        View::Folders => ("Folders", folder_list(app)),
-        _ => ("Artists", artist_list(app)),
-    };
-
-    let header = container(text(title.to_string()).size(12).color(style::rgb(style::TEXT)))
-        .padding(Padding::from([6, 10]))
-        .width(Length::Fill)
-        .style(style::grid_header);
-
-    let left = container(column![header, scrollable(items).height(Length::Fill).style(style::scroller)])
-        .width(Length::Fixed(220.0))
-        .height(Length::Fill)
-        .style(style::sidebar);
-
-    let indices = app.visible_indices();
-    let center = column![
-        container(track_grid(app, &indices, app.layout.0 == Layout::Grouped))
-            .width(Length::Fill)
-            .height(Length::Fill),
-        statusbar(app, indices.len()),
-    ];
-
-    row![
-        left,
-        container(center).width(Length::Fill).height(Length::Fill).style(style::content),
-    ]
-    .height(Length::Fill)
-    .into()
-}
-
-fn artist_list(app: &App) -> Element<'_, Message> {
-    let mut col = Column::new().spacing(1).padding(Padding::from([4, 4]));
-    col = col.push(list_item_btn(
-        "All Artists".to_string(),
-        app.sel_artist.is_none(),
-        Message::SelectArtist("*".to_string()),
-    ));
-    for a in &app.artists {
-        let selected = app.sel_artist.as_deref() == Some(a.name.as_str());
-        col = col.push(list_item_btn(
-            format!("{}  ({})", a.name, a.albums),
-            selected,
-            Message::SelectArtist(a.name.clone()),
-        ));
-    }
-    col.into()
-}
-
-fn genre_list(app: &App) -> Element<'_, Message> {
-    let mut col = Column::new().spacing(1).padding(Padding::from([4, 4]));
-    col = col.push(list_item_btn(
-        "All Genres".to_string(),
-        app.sel_genre.is_none(),
-        Message::SelectGenre("*".to_string()),
-    ));
-    for (name, count) in &app.genres {
-        let selected = app.sel_genre.as_deref() == Some(name.as_str());
-        let label = if name.is_empty() { "(no genre)".to_string() } else { name.clone() };
-        col = col.push(list_item_btn(
-            format!("{label}  ({count})"),
-            selected,
-            Message::SelectGenre(name.clone()),
-        ));
-    }
-    col.into()
-}
-
-fn folder_list(app: &App) -> Element<'_, Message> {
-    let mut col = Column::new().spacing(1).padding(Padding::from([4, 4]));
-    col = col.push(list_item_btn(
-        "All Folders".to_string(),
-        app.sel_folder.is_none(),
-        Message::SelectFolder("*".to_string()),
-    ));
-    for folder in &app.folders {
-        let selected = app.sel_folder.as_deref() == Some(folder.as_str());
-        col = col.push(list_item_btn(
-            folder.clone(),
-            selected,
-            Message::SelectFolder(folder.clone()),
-        ));
-    }
-    col.into()
-}
-
 fn list_item_btn(label: String, selected: bool, msg: Message) -> Element<'static, Message> {
     button(text(label).size(12).wrapping(Wrapping::None))
         .width(Length::Fill)
@@ -996,76 +1258,6 @@ fn list_item_btn(label: String, selected: bool, msg: Message) -> Element<'static
         .on_press(msg)
         .style(move |_t, s| style::list_item(s, selected))
         .into()
-}
-
-// ---- Albums view (MusicBee album browser: cover grid + detail) ----------
-fn albums_view(app: &App) -> Element<'_, Message> {
-    // How many album covers fit per row in the browsing pane.
-    const PER_ROW: usize = 4;
-
-    let title = if app.view.0 == View::AlbumsArtists {
-        "Albums & Artists"
-    } else {
-        "Albums"
-    };
-    let header = container(
-        row![
-            text(title.to_string()).size(12).color(style::rgb(style::TEXT)),
-            text(format!("   {} albums", app.albums.len())).size(11).color(style::rgb(style::TEXT_DIM)),
-        ]
-        .align_y(Alignment::Center),
-    )
-    .padding(Padding::from([6, 10]))
-    .width(Length::Fill)
-    .style(style::grid_header);
-
-    // Optional search filter over album / artist names.
-    let needle = app.search.trim().to_lowercase();
-    let shown: Vec<usize> = app
-        .albums
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| {
-            needle.is_empty()
-                || a.album.to_lowercase().contains(&needle)
-                || a.album_artist.to_lowercase().contains(&needle)
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    let mut grid = Column::new().spacing(16).padding(14);
-    let mut current_row = Row::new().spacing(14);
-    let mut in_row = 0;
-    for &i in &shown {
-        current_row = current_row.push(album_card(app, i, &app.albums[i]));
-        in_row += 1;
-        if in_row == PER_ROW {
-            grid = grid.push(current_row);
-            current_row = Row::new().spacing(14);
-            in_row = 0;
-        }
-    }
-    if in_row > 0 {
-        for _ in in_row..PER_ROW {
-            current_row = current_row.push(Space::new().width(Length::FillPortion(1)));
-        }
-        grid = grid.push(current_row);
-    }
-
-    let left = container(column![
-        header,
-        scrollable(grid).width(Length::Fill).height(Length::Fill).style(style::scroller),
-    ])
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .style(style::content);
-
-    let right = container(album_detail(app))
-        .width(Length::Fixed(380.0))
-        .height(Length::Fill)
-        .style(style::now_playing_panel);
-
-    row![left, right].height(Length::Fill).into()
 }
 
 fn album_card<'a>(app: &'a App, index: usize, album: &'a Album) -> Element<'a, Message> {
@@ -1215,107 +1407,6 @@ fn playlists_view(app: &App) -> Element<'_, Message> {
     .center_x(Length::Fill)
     .center_y(Length::Fill)
     .style(style::content)
-    .into()
-}
-
-// ---- Now Playing side panel (Music view) --------------------------------
-fn now_playing_panel(app: &App) -> Element<'_, Message> {
-    let tab = app.np_tab.0;
-    let tabs = row![
-        np_tab_btn("Now Playing", tab == NpTab::Playing, Message::SetNpTab(NpTab::Playing)),
-        np_tab_btn("Lyrics", tab == NpTab::Lyrics, Message::SetNpTab(NpTab::Lyrics)),
-        np_tab_btn("Info", tab == NpTab::Info, Message::SetNpTab(NpTab::Info)),
-    ]
-    .spacing(0);
-
-    let current = app.current.or(app.selected).and_then(|i| app.tracks.get(i));
-
-    let panel_body: Element<Message> = match tab {
-        NpTab::Playing => {
-            let art = container(big_art(app, current, 200.0))
-                .padding(12)
-                .width(Length::Fill);
-            let meta: Element<Message> = if let Some(t) = current {
-                column![
-                    text(t.title.clone()).size(15).color(style::rgb(style::TEXT)).wrapping(Wrapping::None),
-                    text(t.artist.clone()).size(12).color(style::rgb(0xD0D0D0)).wrapping(Wrapping::None),
-                    Space::new().height(Length::Fixed(8.0)),
-                    np_row("Album", &t.album),
-                    np_row("Genre", &t.genre),
-                    np_row("Year", &if t.year > 0 { t.year.to_string() } else { "\u{2014}".into() }),
-                    np_row("Track", &t.track_number.to_string()),
-                ]
-                .spacing(2)
-                .padding(Padding {
-                    top: 0.0,
-                    right: 12.0,
-                    bottom: 12.0,
-                    left: 12.0,
-                })
-                .into()
-            } else {
-                container(text("No track selected").size(13).color(style::rgb(style::TEXT_DIM)))
-                    .padding(12)
-                    .into()
-            };
-            column![art, meta].into()
-        }
-        NpTab::Lyrics => container(
-            text(
-                current
-                    .map(|t| format!("No lyrics available for \"{}\".", t.title))
-                    .unwrap_or_else(|| "No track is playing.".to_string()),
-            )
-            .size(12)
-            .color(style::rgb(style::TEXT)),
-        )
-        .padding(12)
-        .into(),
-        NpTab::Info => {
-            if let Some(t) = current {
-                column![
-                    np_row("Title", &t.title),
-                    np_row("Artist", &t.artist),
-                    np_row("Album Artist", &t.album_artist),
-                    np_row("Album", &t.album),
-                    np_row("Genre", &t.genre),
-                    np_row("Year", &t.year.to_string()),
-                    np_row("Duration", &t.duration),
-                    np_row("File", &t.path),
-                ]
-                .spacing(2)
-                .padding(12)
-                .into()
-            } else {
-                container(text("No track selected.").size(12).color(style::rgb(style::TEXT_DIM)))
-                    .padding(12)
-                    .into()
-            }
-        }
-    };
-
-    column![
-        container(tabs).width(Length::Fill).style(style::grid_header),
-        scrollable(panel_body).height(Length::Fill).style(style::scroller),
-    ]
-    .height(Length::Fill)
-    .into()
-}
-
-fn np_tab_btn(label: &str, active: bool, msg: Message) -> Element<'_, Message> {
-    button(text(label.to_string()).size(11))
-        .padding(Padding::from([5, 10]))
-        .on_press(msg)
-        .style(move |_t, s| style::nav_tab(s, active, style::rgb(style::ACCENT)))
-        .into()
-}
-
-fn np_row<'a>(key: &str, value: &str) -> Element<'a, Message> {
-    row![
-        text(key.to_string()).size(12).color(style::rgb(style::TEXT_DIM)).width(Length::Fixed(64.0)),
-        text(value.to_string()).size(12).color(style::rgb(style::TEXT)).wrapping(Wrapping::None),
-    ]
-    .spacing(6)
     .into()
 }
 
@@ -1652,23 +1743,45 @@ impl App {
 
     fn ensure_art_for_index(&mut self, index: usize) -> Task<Message> {
         if let Some(track) = self.tracks.get(index) {
-            // Prioritise the current/selected track by pushing it to the front.
             let path = track.path.clone();
             if !self.album_art.contains_key(&path) && self.requested_art.insert(path.clone()) {
-                self.art_pending.push_front(path);
+                // Prioritise the current/selected track by pushing to the front.
+                self.art_pending.push_front(ArtJob::Album {
+                    path,
+                    album_artist: track.album_artist.clone(),
+                    album: track.album.clone(),
+                });
             }
         }
         self.pump_art()
     }
 
-    // Register paths whose album art we still need (deduped). Call `pump_art`
-    // afterwards to actually start fetching.
-    fn queue_art(&mut self, paths: Vec<String>) {
-        for path in paths {
-            if !self.album_art.contains_key(&path) && self.requested_art.insert(path.clone()) {
-                self.art_pending.push_back(path);
-            }
+    // Queue an album's cover for fetching (deduped by its first track's path).
+    fn queue_album_cover(&mut self, album_index: usize) {
+        let Some(album) = self.albums.get(album_index) else {
+            return;
+        };
+        let Some(&first) = album.tracks.first() else {
+            return;
+        };
+        let path = self.tracks[first].path.clone();
+        if self.album_art.contains_key(&path) || !self.requested_art.insert(path.clone()) {
+            return;
         }
+        self.art_pending.push_back(ArtJob::Album {
+            path,
+            album_artist: album.album_artist.clone(),
+            album: album.album.clone(),
+        });
+    }
+
+    // Queue an artist image for fetching (deduped by name).
+    fn queue_artist_image(&mut self, name: String) {
+        let key = format!("@artist@{name}");
+        if self.artist_art.contains_key(&name) || !self.requested_art.insert(key) {
+            return;
+        }
+        self.art_pending.push_back(ArtJob::Artist { name });
     }
 
     // Start fetches up to the concurrency cap. Returns a batch of art-fetch
@@ -1676,17 +1789,26 @@ impl App {
     fn pump_art(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
         while self.art_inflight < MAX_ART_INFLIGHT {
-            let Some(path) = self.art_pending.pop_front() else {
+            let Some(job) = self.art_pending.pop_front() else {
                 break;
             };
             self.art_inflight += 1;
-            tasks.push(Task::perform(
-                async move {
-                    let result = mpd::get_album_art(path.clone());
-                    (path, result)
-                },
-                |(path, result)| Message::AlbumArtLoaded(path, result),
-            ));
+            tasks.push(match job {
+                ArtJob::Album { path, album_artist, album } => Task::perform(
+                    async move {
+                        let result = mpd::get_cover(path.clone(), album_artist, album);
+                        (path, result)
+                    },
+                    |(path, result)| Message::AlbumArtLoaded(path, result),
+                ),
+                ArtJob::Artist { name } => Task::perform(
+                    async move {
+                        let result = mpd::get_artist_image(name.clone());
+                        (name, result)
+                    },
+                    |(name, result)| Message::ArtistArtLoaded(name, result),
+                ),
+            });
         }
         if tasks.is_empty() {
             Task::none()
@@ -1707,18 +1829,8 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, t)| {
-                let scope = match self.view.0 {
-                    View::Artists => self
-                        .sel_artist
-                        .as_deref()
-                        .map(|a| a == "*" || t.album_artist == a)
-                        .unwrap_or(true),
-                    View::Genres => self
-                        .sel_genre
-                        .as_deref()
-                        .map(|g| g == "*" || t.genre == g)
-                        .unwrap_or(true),
-                    View::Folders => self
+                let scope = match self.section.0 {
+                    Section::Folders => self
                         .sel_folder
                         .as_deref()
                         .map(|f| f == "*" || t.path.starts_with(f))

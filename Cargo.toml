@@ -9,3 +9,5 @@ name = "musicbee_iced"
 [dependencies]
 iced = { version = "0.14.0", features = ["image", "tokio"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
