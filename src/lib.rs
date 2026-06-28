@@ -84,6 +84,11 @@ impl MpdClient {
         if let Some(password) = password {
             client.command(&format!("password {}", quote_arg(&password)))?;
         }
+        // Raise the binary chunk limit to 1 MiB so most album art images
+        // (typically 50–500 KB) arrive in a single round-trip instead of
+        // dozens of 8 KB requests. MPD < 0.24 doesn't support this command;
+        // ignore the ACK rather than aborting the connection.
+        let _ = client.command("binarylimit 1048576");
         Ok(client)
     }
 
@@ -132,65 +137,103 @@ impl MpdClient {
     }
 
     fn fetch_binary(&mut self, command: &str, uri: &str) -> Result<Vec<u8>, String> {
-        // MPD requires both URI and offset
-        let cmd = format!("{command} {} 0\n", quote_arg(uri));
-        self.stream
-            .write_all(cmd.as_bytes())
-            .map_err(|e| format!("MPD write failed: {e}"))?;
+        // MPD binary protocol (albumart / readpicture):
+        //
+        //   Client → "albumart <URI> <OFFSET>\n"
+        //   Server → "size: <TOTAL>\n"
+        //             "binary: <CHUNK>\n"
+        //             <CHUNK raw bytes>
+        //             "\n"          ← trailing newline after binary data
+        //             "OK\n"
+        //
+        // One request returns exactly one chunk. The client must re-issue the
+        // command with an increasing offset until it has accumulated TOTAL bytes.
+        // The previous code tried to loop reading more chunks from a single
+        // response, which caused it to read the "OK" as the next "binary:"
+        // header and fail every time.
 
-        // Read a single text line (up to \n) byte-by-byte.
-        // Returns the line content without the trailing \n.
-        fn read_line<R: Read>(r: &mut R) -> Result<String, String> {
+        fn read_text_line<R: Read>(r: &mut R) -> Result<String, String> {
             let mut out = Vec::with_capacity(64);
             loop {
                 let mut buf = [0u8; 1];
-                match r.read_exact(&mut buf) {
-                    Ok(()) => {
-                        if buf[0] == b'\n' {
-                            return Ok(String::from_utf8_lossy(&out).into_owned());
-                        }
-                        out.push(buf[0]);
-                    }
-                    Err(e) => return Err(format!("MPD read failed: {e}")),
+                r.read_exact(&mut buf).map_err(|e| format!("MPD read failed: {e}"))?;
+                if buf[0] == b'\n' {
+                    return Ok(String::from_utf8_lossy(&out).into_owned());
                 }
+                out.push(buf[0]);
             }
         }
 
-        // Read "size: N" line (total size of all binary data)
-        let size_line = read_line(&mut self.reader)?;
-        if size_line.starts_with("ACK") {
-            return Err(size_line);
-        }
-        let total: usize = size_line
-            .strip_prefix("size: ")
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| format!("Expected size: header, got: {size_line}"))?;
+        let mut data: Vec<u8> = Vec::new();
+        let mut total: Option<usize> = None;
 
-        let mut data = Vec::with_capacity(total);
-        // Read chunks until we have `total` bytes
-        while data.len() < total {
-            // Read "binary: CHUNK_SIZE" line
-            let chunk_header = read_line(&mut self.reader)?;
-            if chunk_header.starts_with("ACK") {
-                return Err(chunk_header);
+        loop {
+            let offset = data.len();
+
+            // Send one request for the current offset.
+            let cmd = format!("{command} {} {offset}\n", quote_arg(uri));
+            self.stream
+                .write_all(cmd.as_bytes())
+                .map_err(|e| format!("MPD write failed: {e}"))?;
+
+            // "size: N" — total image size (same in every response)
+            let size_line = read_text_line(&mut self.reader)?;
+            if size_line.starts_with("ACK") {
+                return Err(size_line);
             }
-            let chunk_size: usize = chunk_header
+            let sz: usize = size_line
+                .strip_prefix("size: ")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| format!("Expected 'size:' header, got: {size_line}"))?;
+            if total.is_none() {
+                data.reserve(sz);
+                total = Some(sz);
+            }
+
+            // "binary: N" — number of raw bytes that follow
+            let bin_line = read_text_line(&mut self.reader)?;
+            if bin_line.starts_with("ACK") {
+                return Err(bin_line);
+            }
+            let chunk_sz: usize = bin_line
                 .strip_prefix("binary: ")
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("Expected binary: header, got: {chunk_header}"))?;
+                .ok_or_else(|| format!("Expected 'binary:' header, got: {bin_line}"))?;
 
-            // Read exactly `chunk_size` raw bytes
-            let mut chunk = vec![0u8; chunk_size];
+            if chunk_sz == 0 {
+                return Err("MPD returned an empty binary chunk".to_string());
+            }
+
+            // Read the raw binary bytes directly.
+            let prev = data.len();
+            data.resize(prev + chunk_sz, 0);
             self.reader
-                .read_exact(&mut chunk)
-                .map_err(|e| format!("MPD album art read error: {e}"))?;
-            data.extend_from_slice(&chunk);
-        }
+                .read_exact(&mut data[prev..])
+                .map_err(|e| format!("MPD binary read error: {e}"))?;
 
-        // Read the trailing "OK" line
-        let ok_line = read_line(&mut self.reader)?;
-        if ok_line != "OK" {
-            return Err(format!("Expected OK after album art, got: {ok_line}"));
+            // Consume the '\n' that MPD appends after the binary data.
+            let trailing = read_text_line(&mut self.reader)?;
+            // `trailing` is normally "" (empty line = just the '\n').
+            // Accept "OK" as well for any MPD implementation that skips the
+            // blank separator and goes straight to the terminator.
+            if trailing == "OK" {
+                // Already consumed the terminator — we're done.
+                break;
+            }
+            if !trailing.is_empty() {
+                return Err(format!("Unexpected data after binary chunk: {trailing}"));
+            }
+
+            // Read the "OK" that ends this response.
+            let ok = read_text_line(&mut self.reader)?;
+            if ok != "OK" {
+                return Err(format!("Expected OK after binary chunk, got: {ok}"));
+            }
+
+            // Stop when we have all the bytes.
+            if data.len() >= total.unwrap_or(0) {
+                break;
+            }
         }
 
         Ok(data)

@@ -195,7 +195,7 @@ button { font-family: inherit; font-size: inherit; }
 .row > .cell:last-child { border-right: none; }
 .row.header > .cell { background: linear-gradient(to bottom, var(--header-from), var(--header-to)); border-right: 1px solid var(--header-bd); border-bottom: 1px solid var(--border-dk); font-weight: 600; cursor: default; position: sticky; top: 0; z-index: 2; }
 .row.header > .cell .sort-ind { float: right; color: #777; font-size: 10px; }
-.row.data:nth-child(even) { background: var(--grid-alt); }
+.row.data:nth-child(even), .row.data.row-even { background: var(--grid-alt); }
 .row.data:hover { background: var(--hover); }
 .row.data.selected { background: var(--sel); }
 .row.data.selected:hover { background: var(--sel-2); }

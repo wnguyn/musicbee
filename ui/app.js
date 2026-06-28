@@ -241,6 +241,89 @@
       });
     }
   }
+  // ---- Virtual grid -------------------------------------------------------
+  // Row height must match CSS: padding-top(4) + line-height(22) + padding-bottom(4) = 30px.
+  const ROW_H = 30;
+  const VGRID_BUFFER = 15; // extra rows rendered above + below the viewport
+
+  // One VGrid instance per grid-rows element. Stored in a WeakMap so there
+  // are no leaks if the element is ever removed from the DOM.
+  const _vGrids = new WeakMap();
+
+  // Return (and lazily create) the VGrid for a grid-rows element.
+  function vGridFor(rowsEl) {
+    if (!_vGrids.has(rowsEl)) {
+      // The scroll container is the .grid ancestor (.grid-rows > .grid > .grid-wrap).
+      const gridEl = rowsEl.parentElement;
+      _vGrids.set(rowsEl, new VGrid(gridEl, rowsEl));
+    }
+    return _vGrids.get(rowsEl);
+  }
+
+  class VGrid {
+    constructor(gridEl, rowsEl) {
+      this.g = gridEl;   // scroll container (.grid)
+      this.r = rowsEl;   // spacer + row host (.grid-rows)
+      this.items = [];
+      this.renderFn = null;
+      this._raf = 0;
+      // Passive scroll listener — runs on every scroll event but only
+      // schedules one rAF per frame so it never blocks the main thread.
+      gridEl.addEventListener("scroll", () => {
+        if (this._raf) return;
+        this._raf = requestAnimationFrame(() => { this._raf = 0; this._paint(); });
+      }, { passive: true });
+      rowsEl.style.position = "relative";
+      rowsEl.style.width = "100%";
+    }
+
+    // Replace the current item set. Resets scroll position.
+    setItems(items, renderFn) {
+      this.items = items;
+      this.renderFn = renderFn;
+      this.r.style.height = (items.length * ROW_H) + "px";
+      this.g.scrollTop = 0;
+      this._paint();
+    }
+
+    // Re-apply playing/selected classes on the currently rendered rows without
+    // a full repaint. Called after selection changes or track-change events.
+    updateHighlights() {
+      for (const row of this.r.querySelectorAll(".row.data")) {
+        const t = row._track;
+        if (!t) continue;
+        row.classList.toggle("selected", state.selected.has(t.path));
+        row.classList.toggle("playing-row",
+          state.playingIdx >= 0 &&
+          state.tracks[state.playingIdx] &&
+          state.tracks[state.playingIdx].path === t.path);
+      }
+    }
+
+    _paint() {
+      const st = this.g.scrollTop;
+      const ch = this.g.clientHeight;
+      const B = VGRID_BUFFER;
+      const first = Math.max(0, Math.floor(st / ROW_H) - B);
+      const last  = Math.min(this.items.length, Math.ceil((st + ch) / ROW_H) + B);
+
+      // textContent = "" is faster than innerHTML = "" (no HTML parsing).
+      this.r.textContent = "";
+      const frag = document.createDocumentFragment();
+      for (let i = first; i < last; i++) {
+        const row = this.renderFn(this.items[i], i);
+        row.style.position = "absolute";
+        row.style.top = (i * ROW_H) + "px";
+        row.style.width = "100%";
+        // nth-child(even) doesn't work with absolute positioning because the
+        // DOM only contains the visible window of rows; use an explicit class.
+        if (i % 2 === 0) row.classList.add("row-even");
+        frag.appendChild(row);
+      }
+      this.r.appendChild(frag);
+    }
+  }
+
   function pathHash(path) { let h = 0; for (let i = 0; i < path.length; i++) h = (h * 31 + path.charCodeAt(i)) >>> 0; return h; }
   function deriveMeta() {
     state.meta = new Map();
@@ -351,32 +434,55 @@
     });
   }
 
-  // tracks: already-sorted array. grouped: insert album group headers.
+  // tracks: already-sorted array. opts.grouped: insert album group headers.
   function renderGridRows(rowsEl, tracks, opts) {
     opts = opts || {};
-    rowsEl.innerHTML = "";
-    const frag = document.createDocumentFragment();
     const grouped = !!opts.grouped && tracks.length > 0;
 
-    if (grouped) {
-      // partition by album preserving current sort order within each album
-      const groups = new Map();
-      const order = [];
-      for (const t of tracks) {
-        const k = albumKey(t);
-        if (!groups.has(k)) { groups.set(k, []); order.push(k); }
-        groups.get(k).push(t);
-      }
-      for (const k of order) {
+    if (!grouped) {
+      // ---- Virtual scrolling for flat lists --------------------------------
+      // Only the rows visible in the viewport + a buffer are in the DOM.
+      // The spacer div maintains the correct scrollable height.
+      const vg = vGridFor(rowsEl);
+      vg.setItems(tracks, (t, i) => dataRow(t, opts, i));
+      return;
+    }
+
+    // ---- Grouped layout: chunked rAF rendering ----------------------------
+    // Build group headers + rows in chunks of 300 so the browser stays
+    // responsive while processing large libraries. The first chunk renders
+    // synchronously so the user sees content immediately.
+    rowsEl.style.position = "";
+    rowsEl.style.height = "";
+    rowsEl.textContent = "";
+
+    const groups = new Map();
+    const order = [];
+    for (const t of tracks) {
+      const k = albumKey(t);
+      if (!groups.has(k)) { groups.set(k, []); order.push(k); }
+      groups.get(k).push(t);
+    }
+
+    const CHUNK = 300;
+    let i = 0;
+
+    function renderChunk() {
+      const frag = document.createDocumentFragment();
+      let count = 0;
+      while (i < order.length && count < CHUNK) {
+        const k = order[i++];
         const grp = groups.get(k);
-        const al = state.albums.find((a) => a.key === k) || { album: grp[0].album, album_artist: grp[0].album_artist, year: grp[0].year, genre: grp[0].genre };
+        const al = state.albums.find((a) => a.key === k) ||
+          { album: grp[0].album, album_artist: grp[0].album_artist, year: grp[0].year, genre: grp[0].genre };
         frag.appendChild(groupHeader(al, grp));
         grp.forEach((t) => frag.appendChild(dataRow(t, opts)));
+        count += grp.length + 1;
       }
-    } else {
-      tracks.forEach((t, i) => frag.appendChild(dataRow(t, opts, i)));
+      rowsEl.appendChild(frag);
+      if (i < order.length) requestAnimationFrame(renderChunk);
     }
-    rowsEl.appendChild(frag);
+    renderChunk();
   }
 
   function groupHeader(al, tracks) {
@@ -442,7 +548,12 @@
     state.lastAnchor = path; updateStatus();
   }
   function refreshAllGridSelections() {
-    $$(".grid-rows").forEach((rows) => $$(".row.data", rows).forEach((r) => { if (r._track) r.classList.toggle("selected", state.selected.has(r._track.path)); }));
+    $$(".grid-rows").forEach((rows) => {
+      // For virtual grids, delegate to updateHighlights which also sets
+      // playing-row. For regular (grouped/chunked) grids, walk the DOM directly.
+      if (_vGrids.has(rows)) { _vGrids.get(rows).updateHighlights(); return; }
+      $$(".row.data", rows).forEach((r) => { if (r._track) r.classList.toggle("selected", state.selected.has(r._track.path)); });
+    });
   }
 
   // ====================================================================
