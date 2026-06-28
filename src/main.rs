@@ -14,10 +14,16 @@ use iced::widget::{
 use iced::widget::text::Wrapping;
 use iced::{application, window, Alignment, Color, Element, Length, Padding, Subscription, Task, Theme};
 use musicbee_iced::{self as mpd, AlbumArt, MpdStatus, Track};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-const TRACK_RENDER_LIMIT: usize = 1_500;
+// Cap how many track rows are ever built at once. The album-centric views
+// keep lists short (one album at a time); this only bounds the flat "Music"
+// list so the widget tree never explodes and the UI stays responsive.
+const TRACK_RENDER_LIMIT: usize = 350;
+// Bounded concurrency for album-art fetches. MPD opens a fresh connection per
+// request, so we stream covers in a few at a time instead of all at once.
+const MAX_ART_INFLIGHT: usize = 6;
 
 // ---- Column layout (matches the original grid template) -----------------
 const W_NUM: Length = Length::Fixed(40.0);
@@ -121,6 +127,8 @@ struct App {
     np_tab: NpTabState,
     album_art: HashMap<String, Option<image::Handle>>,
     requested_art: HashSet<String>,
+    art_pending: VecDeque<String>,
+    art_inflight: usize,
     albums: Vec<Album>,
     artists: Vec<ArtistRow>,
     genres: Vec<(String, usize)>,
@@ -140,7 +148,7 @@ struct App {
 struct ViewState(View);
 impl Default for ViewState {
     fn default() -> Self {
-        ViewState(View::Music)
+        ViewState(View::Albums)
     }
 }
 #[derive(Debug)]
@@ -251,7 +259,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.rebuild_collections();
                     app.status_message = format!("{} tracks loaded", app.tracks.len());
                     app.error = None;
-                    app.sync_current_from_status()
+                    if app.sel_album.is_none() && !app.albums.is_empty() {
+                        app.sel_album = Some(0);
+                    }
+                    // Begin streaming album covers for every album.
+                    let cover_paths: Vec<String> = app
+                        .albums
+                        .iter()
+                        .filter_map(|a| a.tracks.first().map(|&i| app.tracks[i].path.clone()))
+                        .collect();
+                    app.queue_art(cover_paths);
+                    Task::batch([app.sync_current_from_status(), app.pump_art()])
                 }
                 Err(error) => {
                     app.error = Some(error);
@@ -295,7 +313,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::AlbumArtLoaded(path, result) => {
             let handle = result.ok().map(|art| image::Handle::from_bytes(art.data));
             app.album_art.insert(path, handle);
-            Task::none()
+            app.art_inflight = app.art_inflight.saturating_sub(1);
+            app.pump_art()
         }
         Message::CommandFinished(result) => {
             if let Err(error) = result {
@@ -354,7 +373,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SelectAlbum(index) => {
             app.sel_album = Some(index);
-            Task::none()
+            // Make sure the selected album's tracks have art queued.
+            if let Some(album) = app.albums.get(index) {
+                let paths: Vec<String> =
+                    album.tracks.iter().map(|&i| app.tracks[i].path.clone()).collect();
+                app.queue_art(paths);
+            }
+            app.pump_art()
         }
         Message::PlayAlbum(index) => {
             if let Some(album) = app.albums.get(index) {
@@ -851,7 +876,7 @@ fn group_header_row<'a>(app: &'a App, key: &str, track: &'a Track) -> Element<'a
         .find(|a| a.key == key)
         .map(|a| a.tracks.len())
         .unwrap_or(1);
-    let tile = art_tile_small(key, &track.album, 46.0);
+    let tile = small_art(app, Some(track), 46.0);
     let year = if track.year > 0 { format!("  ({})", track.year) } else { String::new() };
     let info = column![
         text(format!("{}{}", track.album, year)).size(13).color(style::rgb(style::ACCENT_2)).wrapping(Wrapping::None),
@@ -973,13 +998,20 @@ fn list_item_btn(label: String, selected: bool, msg: Message) -> Element<'static
         .into()
 }
 
-// ---- Albums view (card grid) --------------------------------------------
+// ---- Albums view (MusicBee album browser: cover grid + detail) ----------
 fn albums_view(app: &App) -> Element<'_, Message> {
-    const PER_ROW: usize = 5;
+    // How many album covers fit per row in the browsing pane.
+    const PER_ROW: usize = 4;
+
+    let title = if app.view.0 == View::AlbumsArtists {
+        "Albums & Artists"
+    } else {
+        "Albums"
+    };
     let header = container(
         row![
-            text("Albums").size(12).color(style::rgb(style::TEXT)),
-            text(format!("  {} albums", app.albums.len())).size(11).color(style::rgb(style::TEXT_DIM)),
+            text(title.to_string()).size(12).color(style::rgb(style::TEXT)),
+            text(format!("   {} albums", app.albums.len())).size(11).color(style::rgb(style::TEXT_DIM)),
         ]
         .align_y(Alignment::Center),
     )
@@ -987,15 +1019,29 @@ fn albums_view(app: &App) -> Element<'_, Message> {
     .width(Length::Fill)
     .style(style::grid_header);
 
-    let mut grid = Column::new().spacing(14).padding(12);
-    let mut current_row = Row::new().spacing(12);
+    // Optional search filter over album / artist names.
+    let needle = app.search.trim().to_lowercase();
+    let shown: Vec<usize> = app
+        .albums
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            needle.is_empty()
+                || a.album.to_lowercase().contains(&needle)
+                || a.album_artist.to_lowercase().contains(&needle)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut grid = Column::new().spacing(16).padding(14);
+    let mut current_row = Row::new().spacing(14);
     let mut in_row = 0;
-    for (i, album) in app.albums.iter().enumerate() {
-        current_row = current_row.push(album_card(app, i, album));
+    for &i in &shown {
+        current_row = current_row.push(album_card(app, i, &app.albums[i]));
         in_row += 1;
         if in_row == PER_ROW {
             grid = grid.push(current_row);
-            current_row = Row::new().spacing(12);
+            current_row = Row::new().spacing(14);
             in_row = 0;
         }
     }
@@ -1006,19 +1052,26 @@ fn albums_view(app: &App) -> Element<'_, Message> {
         grid = grid.push(current_row);
     }
 
-    let body = column![header, scrollable(grid).height(Length::Fill).style(style::scroller)];
-    container(body)
-        .width(Length::Fill)
+    let left = container(column![
+        header,
+        scrollable(grid).width(Length::Fill).height(Length::Fill).style(style::scroller),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(style::content);
+
+    let right = container(album_detail(app))
+        .width(Length::Fixed(380.0))
         .height(Length::Fill)
-        .style(style::content)
-        .into()
+        .style(style::now_playing_panel);
+
+    row![left, right].height(Length::Fill).into()
 }
 
 fn album_card<'a>(app: &'a App, index: usize, album: &'a Album) -> Element<'a, Message> {
     let selected = app.sel_album == Some(index);
-    let tile = art_tile_big(&album.key, &album.album, &album.genre);
     let card = column![
-        tile,
+        album_cover(app, album, Length::Fill, 160.0),
         text(album.album.clone()).size(12).color(style::rgb(style::TEXT)).wrapping(Wrapping::None),
         text(album.album_artist.clone()).size(11).color(style::rgb(style::TEXT_DIM)).wrapping(Wrapping::None),
         text(format!("{}  \u{00b7}  {} trk", album.year, album.tracks.len()))
@@ -1044,6 +1097,105 @@ fn album_card<'a>(app: &'a App, index: usize, album: &'a Album) -> Element<'a, M
     mouse_area(wrapped)
         .on_press(Message::SelectAlbum(index))
         .on_double_click(Message::PlayAlbum(index))
+        .into()
+}
+
+// Album artwork that uses the real cover when loaded, else a coloured tile.
+fn album_cover<'a>(app: &'a App, album: &'a Album, width: Length, height: f32) -> Element<'a, Message> {
+    if let Some(t) = album.tracks.first().and_then(|&i| app.tracks.get(i)) {
+        if let Some(Some(handle)) = app.album_art.get(&t.path) {
+            return container(
+                image(handle.clone())
+                    .width(width)
+                    .height(Length::Fixed(height))
+                    .content_fit(iced::ContentFit::Cover),
+            )
+            .width(width)
+            .height(Length::Fixed(height))
+            .clip(true)
+            .style(style::art_tile(style::rgb(style::BORDER_DK)))
+            .into();
+        }
+    }
+    let (color, initial) = tile_for(&album.key, &album.album);
+    let label = if album.genre.is_empty() { String::new() } else { album.genre.to_uppercase() };
+    container(
+        column![
+            text(initial).size(44).color(Color::from_rgba(1.0, 1.0, 1.0, 0.92)),
+            text(label).size(9).color(Color::from_rgba(1.0, 1.0, 1.0, 0.75)),
+        ]
+        .align_x(Alignment::Center)
+        .spacing(2),
+    )
+    .width(width)
+    .height(Length::Fixed(height))
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .style(style::art_tile(color))
+    .into()
+}
+
+// Right-hand detail pane: the selected album's cover, info, and track list.
+fn album_detail(app: &App) -> Element<'_, Message> {
+    let Some(index) = app.sel_album else {
+        return container(text("Select an album").size(13).color(style::rgb(style::TEXT_DIM)))
+            .padding(16)
+            .into();
+    };
+    let Some(album) = app.albums.get(index) else {
+        return container(text("Select an album").size(13).color(style::rgb(style::TEXT_DIM)))
+            .padding(16)
+            .into();
+    };
+
+    let head = column![
+        album_cover(app, album, Length::Fill, 280.0),
+        text(album.album.clone()).size(16).color(style::rgb(style::TEXT)).wrapping(Wrapping::None),
+        text(album.album_artist.clone()).size(13).color(style::rgb(0xD0D0D0)).wrapping(Wrapping::None),
+        text(format!(
+            "{}  \u{00b7}  {} tracks",
+            if album.year > 0 { album.year.to_string() } else { "\u{2014}".into() },
+            album.tracks.len()
+        ))
+        .size(11)
+        .color(style::rgb(style::TEXT_DIM)),
+        button(text("\u{25B6} Play album").size(12))
+            .padding(Padding::from([5, 10]))
+            .on_press(Message::PlayAlbum(index))
+            .style(|_t, s| style::transport_btn(s, true)),
+    ]
+    .spacing(6)
+    .padding(12);
+
+    let mut list = Column::new().spacing(0);
+    for (n, &ti) in album.tracks.iter().enumerate() {
+        list = list.push(album_track_row(app, ti, n + 1));
+    }
+
+    column![
+        head,
+        scrollable(list).height(Length::Fill).style(style::scroller),
+    ]
+    .height(Length::Fill)
+    .into()
+}
+
+fn album_track_row(app: &App, index: usize, num: usize) -> Element<'_, Message> {
+    let track = &app.tracks[index];
+    let is_selected = app.selected == Some(index);
+    let is_playing = app.current == Some(index);
+    let kind = if is_selected { 2 } else if is_playing { 3 } else { 0 };
+    let num_label = if is_playing { format!("\u{25B6}{num}") } else { num.to_string() };
+    let cells = row![
+        text(num_label).size(12).color(style::rgb(style::TEXT_DIM)).width(Length::Fixed(30.0)),
+        text(track.title.clone()).size(12).color(style::rgb(style::TEXT)).wrapping(Wrapping::None).width(Length::Fill),
+        text(track.duration.clone()).size(12).color(style::rgb(style::TEXT_DIM)).width(Length::Fixed(46.0)).align_x(iced::alignment::Horizontal::Right),
+    ]
+    .spacing(6)
+    .padding(Padding::from([4, 10]));
+    mouse_area(container(cells).width(Length::Fill).style(style::row(kind)))
+        .on_press(Message::SelectTrack(index))
+        .on_double_click(Message::PlayTrack(index))
         .into()
 }
 
@@ -1403,36 +1555,6 @@ fn art_element<'a>(app: &'a App, track: Option<&'a Track>, size: f32, font: f32)
         .into()
 }
 
-fn art_tile_small<'a>(key: &str, album: &str, size: f32) -> Element<'a, Message> {
-    let (color, initial) = tile_for(key, album);
-    container(text(initial).size(20).color(Color::from_rgba(1.0, 1.0, 1.0, 0.92)))
-        .width(Length::Fixed(size))
-        .height(Length::Fixed(size))
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .style(style::art_tile(color))
-        .into()
-}
-
-fn art_tile_big<'a>(key: &str, album: &str, genre: &str) -> Element<'a, Message> {
-    let (color, initial) = tile_for(key, album);
-    let label = if genre.is_empty() { String::new() } else { genre.to_uppercase() };
-    container(
-        column![
-            text(initial).size(44).color(Color::from_rgba(1.0, 1.0, 1.0, 0.92)),
-            text(label).size(9).color(Color::from_rgba(1.0, 1.0, 1.0, 0.75)),
-        ]
-        .align_x(Alignment::Center)
-        .spacing(2),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(140.0))
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
-    .style(style::art_tile(color))
-    .into()
-}
-
 // ===================================================================
 //  App helpers
 // ===================================================================
@@ -1529,21 +1651,48 @@ impl App {
     }
 
     fn ensure_art_for_index(&mut self, index: usize) -> Task<Message> {
-        let Some(track) = self.tracks.get(index) else {
-            return Task::none();
-        };
-        let path = track.path.clone();
-        if self.album_art.contains_key(&path) || self.requested_art.contains(&path) {
-            return Task::none();
+        if let Some(track) = self.tracks.get(index) {
+            // Prioritise the current/selected track by pushing it to the front.
+            let path = track.path.clone();
+            if !self.album_art.contains_key(&path) && self.requested_art.insert(path.clone()) {
+                self.art_pending.push_front(path);
+            }
         }
-        self.requested_art.insert(path.clone());
-        Task::perform(
-            async move {
-                let result = mpd::get_album_art(path.clone());
-                (path, result)
-            },
-            |(path, result)| Message::AlbumArtLoaded(path, result),
-        )
+        self.pump_art()
+    }
+
+    // Register paths whose album art we still need (deduped). Call `pump_art`
+    // afterwards to actually start fetching.
+    fn queue_art(&mut self, paths: Vec<String>) {
+        for path in paths {
+            if !self.album_art.contains_key(&path) && self.requested_art.insert(path.clone()) {
+                self.art_pending.push_back(path);
+            }
+        }
+    }
+
+    // Start fetches up to the concurrency cap. Returns a batch of art-fetch
+    // tasks; each completion calls back into `pump_art` to keep the pipe full.
+    fn pump_art(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        while self.art_inflight < MAX_ART_INFLIGHT {
+            let Some(path) = self.art_pending.pop_front() else {
+                break;
+            };
+            self.art_inflight += 1;
+            tasks.push(Task::perform(
+                async move {
+                    let result = mpd::get_album_art(path.clone());
+                    (path, result)
+                },
+                |(path, result)| Message::AlbumArtLoaded(path, result),
+            ));
+        }
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
+        }
     }
 
     // The list of track indices to render for the active view, after search
