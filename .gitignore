@@ -1,0 +1,4 @@
+target/
+/result
+*.tmp
+.DS_Store
