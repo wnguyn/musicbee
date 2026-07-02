@@ -273,9 +273,7 @@ pub fn nav_tab(status: button::Status, active: bool, accent: Color) -> button::S
 
 pub fn toolbar_btn(status: button::Status, active: bool) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    let bg = if active {
-        linear(0x565656, 0x3C4650)
-    } else if hovered {
+    let bg = if active || hovered {
         linear(0x565656, 0x3C4650)
     } else {
         linear(0x4C4C4C, 0x343434)

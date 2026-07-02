@@ -21,6 +21,14 @@ use std::time::Duration;
 // keep lists short (one album at a time); this only bounds the flat "Music"
 // list so the widget tree never explodes and the UI stays responsive.
 const TRACK_RENDER_LIMIT: usize = 350;
+// Cap cover-grid widgets so large libraries stay scrollable without building
+// thousands of album/artist cards at once.
+const COVER_GRID_RENDER_LIMIT: usize = 80;
+const ARTIST_GRID_RENDER_LIMIT: usize = 50;
+// Only prefetch art for albums near the current selection instead of the
+// entire library on load.
+const INITIAL_ART_BATCH: usize = 24;
+const SEARCH_DEBOUNCE_MS: u64 = 200;
 // Bounded concurrency for album-art fetches. MPD opens a fresh connection per
 // request, so we stream covers in a few at a time instead of all at once.
 const MAX_ART_INFLIGHT: usize = 6;
@@ -110,11 +118,13 @@ struct Album {
     year: u32,
     genre: String,
     tracks: Vec<usize>,
+    search_text: String,
 }
 
 #[derive(Debug, Clone)]
 struct ArtistRow {
     name: String,
+    search_text: String,
     albums: usize,
 }
 
@@ -125,6 +135,9 @@ struct App {
     view: ViewState,
     section: SectionState,
     search: String,
+    search_filter: String,
+    search_haystack: Vec<String>,
+    cached_visible: Vec<usize>,
     quick_title: String,
     quick_artist: String,
     quick_album: String,
@@ -202,6 +215,7 @@ enum Message {
     ArtistArtLoaded(String, Result<AlbumArt, String>),
     CommandFinished(Result<(), String>),
     SearchChanged(String),
+    ApplySearchFilter,
     QuickTitle(String),
     QuickArtist(String),
     QuickAlbum(String),
@@ -267,8 +281,14 @@ fn boot() -> (App, Task<Message>) {
     )
 }
 
-fn subscription(_app: &App) -> Subscription<Message> {
-    iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
+fn subscription(app: &App) -> Subscription<Message> {
+    let tick = iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick);
+    let debounce = if app.search != app.search_filter {
+        iced::time::every(Duration::from_millis(SEARCH_DEBOUNCE_MS)).map(|_| Message::ApplySearchFilter)
+    } else {
+        Subscription::none()
+    };
+    Subscription::batch([tick, debounce])
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -285,15 +305,23 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                             .then(a.title.cmp(&b.title))
                     });
                     app.tracks = tracks;
+                    app.search_haystack = app
+                        .tracks
+                        .iter()
+                        .map(|t| format!("{} {} {} {}", t.title, t.artist, t.album, t.genre).to_lowercase())
+                        .collect();
                     app.rebuild_collections();
+                    app.recompute_visible_indices();
                     app.status_message = format!("{} tracks loaded", app.tracks.len());
                     app.error = None;
                     if app.sel_album.is_none() && !app.albums.is_empty() {
                         app.sel_album = Some(0);
                     }
-                    // Begin streaming covers for every album.
-                    for i in 0..app.albums.len() {
+                    // Stream covers for the selected album and a small initial
+                    // batch instead of queuing the entire library at once.
+                    if let Some(i) = app.sel_album {
                         app.queue_album_cover(i);
+                        app.queue_album_covers_batch(0, INITIAL_ART_BATCH);
                     }
                     Task::batch([app.sync_current_from_status(), app.pump_art()])
                 }
@@ -358,16 +386,27 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.search = query;
             Task::none()
         }
+        Message::ApplySearchFilter => {
+            let filter = app.search.trim().to_lowercase();
+            if app.search_filter != filter {
+                app.search_filter = filter;
+                app.recompute_visible_indices();
+            }
+            Task::none()
+        }
         Message::QuickTitle(v) => {
             app.quick_title = v;
+            app.recompute_visible_indices();
             Task::none()
         }
         Message::QuickArtist(v) => {
             app.quick_artist = v;
+            app.recompute_visible_indices();
             Task::none()
         }
         Message::QuickAlbum(v) => {
             app.quick_album = v;
+            app.recompute_visible_indices();
             Task::none()
         }
         Message::Tick => Task::perform(async { mpd::get_mpd_status() }, Message::StatusLoaded),
@@ -379,12 +418,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.section = SectionState(section);
             app.view = ViewState(View::Music);
             app.open_artist = None;
-            // Lazily request artist images the first time Artists is opened.
+            app.recompute_visible_indices();
+            // Prefetch art only for the first visible cards in the section.
             if section == Section::Artists {
-                let names: Vec<String> = app.artists.iter().map(|a| a.name.clone()).collect();
-                for name in names {
-                    app.queue_artist_image(name);
+                let limit = ARTIST_GRID_RENDER_LIMIT.min(app.artists.len());
+                for i in 0..limit {
+                    app.queue_artist_image(app.artists[i].name.clone());
                 }
+                return app.pump_art();
+            }
+            if section == Section::Albums {
+                app.queue_album_covers_batch(0, INITIAL_ART_BATCH);
                 return app.pump_art();
             }
             Task::none()
@@ -433,11 +477,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SelectFolder(path) => {
             app.sel_folder = Some(path);
+            app.recompute_visible_indices();
             Task::none()
         }
         Message::SelectAlbum(index) => {
             app.sel_album = Some(index);
             app.queue_album_cover(index);
+            // Also prefetch covers for nearby albums in the grid.
+            let start = index.saturating_sub(INITIAL_ART_BATCH / 2);
+            app.queue_album_covers_batch(start, INITIAL_ART_BATCH);
             app.pump_art()
         }
         Message::PlayAlbum(index) => {
@@ -735,23 +783,22 @@ fn library_button(icon: &str, label: &str, selected: bool, msg: Message) -> Elem
 
 // Albums section: cover grid on the left, selected-album detail on the right.
 fn albums_section(app: &App) -> Element<'_, Message> {
-    let needle = app.search.trim().to_lowercase();
+    let needle = app.search_filter.as_str();
     let shown: Vec<usize> = app
         .albums
         .iter()
         .enumerate()
-        .filter(|(_, a)| {
-            needle.is_empty()
-                || a.album.to_lowercase().contains(&needle)
-                || a.album_artist.to_lowercase().contains(&needle)
-        })
+        .filter(|(_, a)| needle.is_empty() || a.search_text.contains(needle))
         .map(|(i, _)| i)
         .collect();
 
     let header = section_header("Albums", &format!("{} albums", shown.len()));
     let left = container(column![
         header,
-        scrollable(cover_grid(app, &shown, 4)).width(Length::Fill).height(Length::Fill).style(style::scroller),
+        scrollable(cover_grid(app, &shown, 4, COVER_GRID_RENDER_LIMIT))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(style::scroller),
     ])
     .width(Length::Fill)
     .height(Length::Fill);
@@ -770,20 +817,21 @@ fn artists_section(app: &App) -> Element<'_, Message> {
         return artist_detail(app, &name);
     }
 
-    let needle = app.search.trim().to_lowercase();
+    let needle = app.search_filter.as_str();
     let shown: Vec<&ArtistRow> = app
         .artists
         .iter()
-        .filter(|a| needle.is_empty() || a.name.to_lowercase().contains(&needle))
+        .filter(|a| needle.is_empty() || a.search_text.contains(needle))
         .collect();
 
     let header = section_header("Artists", &format!("{} artists", shown.len()));
 
     const PER_ROW: usize = 5;
+    let render_count = shown.len().min(ARTIST_GRID_RENDER_LIMIT);
     let mut grid = Column::new().spacing(16).padding(14);
     let mut current_row = Row::new().spacing(14);
     let mut in_row = 0;
-    for a in &shown {
+    for a in shown.iter().take(render_count) {
         current_row = current_row.push(artist_card(app, a));
         in_row += 1;
         if in_row == PER_ROW {
@@ -797,6 +845,19 @@ fn artists_section(app: &App) -> Element<'_, Message> {
             current_row = current_row.push(Space::new().width(Length::FillPortion(1)));
         }
         grid = grid.push(current_row);
+    }
+    if shown.len() > ARTIST_GRID_RENDER_LIMIT {
+        grid = grid.push(
+            container(
+                text(format!(
+                    "Showing first {ARTIST_GRID_RENDER_LIMIT} of {} artists \u{2014} refine your search.",
+                    shown.len()
+                ))
+                .size(11)
+                .color(style::rgb(style::TEXT_DIM)),
+            )
+            .padding(10),
+        );
     }
 
     column![
@@ -838,7 +899,10 @@ fn artist_detail<'a>(app: &'a App, name: &str) -> Element<'a, Message> {
 
     let left = container(column![
         header,
-        scrollable(cover_grid(app, &album_indices, 4)).width(Length::Fill).height(Length::Fill).style(style::scroller),
+        scrollable(cover_grid(app, &album_indices, 4, COVER_GRID_RENDER_LIMIT))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(style::scroller),
     ])
     .width(Length::Fill)
     .height(Length::Fill);
@@ -889,7 +953,10 @@ fn genres_section(app: &App) -> Element<'_, Message> {
 
     let left = container(column![
         header,
-        scrollable(cover_grid(app, &shown, 4)).width(Length::Fill).height(Length::Fill).style(style::scroller),
+        scrollable(cover_grid(app, &shown, 4, COVER_GRID_RENDER_LIMIT))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(style::scroller),
     ])
     .width(Length::Fill)
     .height(Length::Fill);
@@ -912,10 +979,10 @@ fn genre_chip(label: &str, selected: bool, msg: Message) -> Element<'static, Mes
 
 // Songs section: the flat track list (capped) with quick filters.
 fn songs_section(app: &App) -> Element<'_, Message> {
-    let indices = app.visible_indices();
+    let indices = &app.cached_visible;
     column![
         quickfilter(app),
-        container(track_grid(app, &indices, app.layout.0 == Layout::Grouped))
+        container(track_grid(app, indices, app.layout.0 == Layout::Grouped))
             .width(Length::Fill)
             .height(Length::Fill),
         statusbar(app, indices.len()),
@@ -945,9 +1012,9 @@ fn folders_section(app: &App) -> Element<'_, Message> {
     .height(Length::Fill)
     .style(style::sidebar);
 
-    let indices = app.visible_indices();
+    let indices = &app.cached_visible;
     let center = column![
-        container(track_grid(app, &indices, false)).width(Length::Fill).height(Length::Fill),
+        container(track_grid(app, indices, false)).width(Length::Fill).height(Length::Fill),
         statusbar(app, indices.len()),
     ];
 
@@ -971,11 +1038,17 @@ fn section_header<'a>(title: &str, sub: &str) -> Element<'a, Message> {
 }
 
 // Shared album cover grid used by Albums / Artists detail / Genres.
-fn cover_grid<'a>(app: &'a App, indices: &[usize], per_row: usize) -> Element<'a, Message> {
+fn cover_grid<'a>(
+    app: &'a App,
+    indices: &[usize],
+    per_row: usize,
+    render_limit: usize,
+) -> Element<'a, Message> {
+    let render_count = indices.len().min(render_limit);
     let mut grid = Column::new().spacing(16).padding(14);
     let mut current_row = Row::new().spacing(14);
     let mut in_row = 0;
-    for &i in indices {
+    for &i in indices.iter().take(render_count) {
         current_row = current_row.push(album_card(app, i, &app.albums[i]));
         in_row += 1;
         if in_row == per_row {
@@ -989,6 +1062,19 @@ fn cover_grid<'a>(app: &'a App, indices: &[usize], per_row: usize) -> Element<'a
             current_row = current_row.push(Space::new().width(Length::FillPortion(1)));
         }
         grid = grid.push(current_row);
+    }
+    if indices.len() > render_limit {
+        grid = grid.push(
+            container(
+                text(format!(
+                    "Showing first {render_limit} of {} albums \u{2014} refine your search.",
+                    indices.len()
+                ))
+                .size(11)
+                .color(style::rgb(style::TEXT_DIM)),
+            )
+            .padding(10),
+        );
     }
     grid.into()
 }
@@ -1465,7 +1551,8 @@ fn queue_view(app: &App) -> Element<'_, Message> {
             .padding(20),
         );
     } else {
-        for (i, t) in app.queue.iter().enumerate() {
+        let total = app.queue.len();
+        for (i, t) in app.queue.iter().enumerate().take(TRACK_RENDER_LIMIT) {
             let kind = if i as i32 == app.queue_idx { 3 } else { (i % 2) as u8 };
             let playing = i as i32 == app.queue_idx;
             let num = if playing { format!("\u{25B6} {}", i + 1) } else { (i + 1).to_string() };
@@ -1482,6 +1569,18 @@ fn queue_view(app: &App) -> Element<'_, Message> {
                 mouse_area(rc)
                     .on_press(Message::PlayQueueIndex(i))
                     .on_double_click(Message::PlayQueueIndex(i)),
+            );
+        }
+        if total > TRACK_RENDER_LIMIT {
+            rows = rows.push(
+                container(
+                    text(format!(
+                        "Showing first {TRACK_RENDER_LIMIT} of {total} tracks \u{2014} clear or play to manage a shorter queue."
+                    ))
+                    .size(11)
+                    .color(style::rgb(style::TEXT_DIM)),
+                )
+                .padding(10),
             );
         }
     }
@@ -1678,6 +1777,7 @@ impl App {
                     year: t.year,
                     genre: t.genre.clone(),
                     tracks: Vec::new(),
+                    search_text: format!("{} {}", t.album, t.album_artist).to_lowercase(),
                 });
                 albums.len() - 1
             });
@@ -1699,6 +1799,7 @@ impl App {
             .iter()
             .map(|name| ArtistRow {
                 name: name.clone(),
+                search_text: name.to_lowercase(),
                 albums: artist_albums.get(name).copied().unwrap_or(0),
             })
             .collect();
@@ -1754,6 +1855,14 @@ impl App {
             }
         }
         self.pump_art()
+    }
+
+    // Queue a contiguous run of album covers starting at `start`.
+    fn queue_album_covers_batch(&mut self, start: usize, count: usize) {
+        let end = (start + count).min(self.albums.len());
+        for i in start..end {
+            self.queue_album_cover(i);
+        }
     }
 
     // Queue an album's cover for fetching (deduped by its first track's path).
@@ -1817,18 +1926,18 @@ impl App {
         }
     }
 
-    // The list of track indices to render for the active view, after search
-    // and (for Music) quick filters and (for selector views) the selection.
-    fn visible_indices(&self) -> Vec<usize> {
-        let search = self.search.trim().to_lowercase();
+    // Recompute the cached track index list used by Songs / Folders views.
+    fn recompute_visible_indices(&mut self) {
+        let search = self.search_filter.as_str();
         let qt = self.quick_title.trim().to_lowercase();
         let qa = self.quick_artist.trim().to_lowercase();
         let ql = self.quick_album.trim().to_lowercase();
 
-        self.tracks
+        self.cached_visible = self
+            .tracks
             .iter()
             .enumerate()
-            .filter(|(_, t)| {
+            .filter(|(i, t)| {
                 let scope = match self.section.0 {
                     Section::Folders => self
                         .sel_folder
@@ -1841,8 +1950,12 @@ impl App {
                     return false;
                 }
                 if !search.is_empty() {
-                    let hay = format!("{} {} {} {}", t.title, t.artist, t.album, t.genre).to_lowercase();
-                    if !hay.contains(&search) {
+                    let hay = self
+                        .search_haystack
+                        .get(*i)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    if !hay.contains(search) {
                         return false;
                     }
                 }
@@ -1858,7 +1971,7 @@ impl App {
                 true
             })
             .map(|(i, _)| i)
-            .collect()
+            .collect();
     }
 
     // Tracks to enqueue when the user plays `index`: the album it belongs to
@@ -1871,7 +1984,7 @@ impl App {
                 return album.tracks.clone();
             }
         }
-        let visible = self.visible_indices();
+        let visible = self.cached_visible.clone();
         if visible.contains(&index) {
             visible
         } else {

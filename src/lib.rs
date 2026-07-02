@@ -121,20 +121,17 @@ impl MpdClient {
         }
     }
 
-    fn fetch_binary(&mut self, command: &str, uri: &str) -> Result<Vec<u8>, String> {
-        fn read_text_line<R: Read>(r: &mut R) -> Result<String, String> {
-            let mut out = Vec::with_capacity(64);
-            loop {
-                let mut buf = [0u8; 1];
-                r.read_exact(&mut buf)
-                    .map_err(|e| format!("MPD read failed: {e}"))?;
-                if buf[0] == b'\n' {
-                    return Ok(String::from_utf8_lossy(&out).into_owned());
-                }
-                out.push(buf[0]);
-            }
-        }
+    fn read_text_line(&mut self) -> Result<String, String> {
+        let mut line = Vec::with_capacity(64);
+        self.reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("MPD read failed: {e}"))?;
+        Ok(String::from_utf8_lossy(&line)
+            .trim_end_matches(['\r', '\n'])
+            .to_string())
+    }
 
+    fn fetch_binary(&mut self, command: &str, uri: &str) -> Result<Vec<u8>, String> {
         let mut data = Vec::new();
         let mut total = None;
 
@@ -145,7 +142,7 @@ impl MpdClient {
                 .write_all(cmd.as_bytes())
                 .map_err(|e| format!("MPD write failed: {e}"))?;
 
-            let size_line = read_text_line(&mut self.reader)?;
+            let size_line = self.read_text_line()?;
             if size_line.starts_with("ACK") {
                 return Err(size_line);
             }
@@ -158,7 +155,7 @@ impl MpdClient {
                 total = Some(size);
             }
 
-            let binary_line = read_text_line(&mut self.reader)?;
+            let binary_line = self.read_text_line()?;
             if binary_line.starts_with("ACK") {
                 return Err(binary_line);
             }
@@ -176,7 +173,7 @@ impl MpdClient {
                 .read_exact(&mut data[prev..])
                 .map_err(|e| format!("MPD binary read error: {e}"))?;
 
-            let trailing = read_text_line(&mut self.reader)?;
+            let trailing = self.read_text_line()?;
             if trailing == "OK" {
                 break;
             }
@@ -184,7 +181,7 @@ impl MpdClient {
                 return Err(format!("Unexpected data after binary chunk: {trailing}"));
             }
 
-            let ok = read_text_line(&mut self.reader)?;
+            let ok = self.read_text_line()?;
             if ok != "OK" {
                 return Err(format!("Expected OK after binary chunk, got: {ok}"));
             }
@@ -388,7 +385,7 @@ fn pick_image(images: Option<&serde_json::Value>) -> Result<String, String> {
         if url.contains("2a96cbd8b46e442fc41c2b86b821562f") {
             continue;
         }
-        let r = rank(item.get("size").and_then(|s| s.as_str()).unwrap_or("")) as i32;
+        let r = rank(item.get("size").and_then(|s| s.as_str()).unwrap_or(""));
         if r > best_rank {
             best_rank = r;
             best = Some(url.to_string());
